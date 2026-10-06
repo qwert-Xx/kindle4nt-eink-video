@@ -10,7 +10,7 @@ Kindle 4 墨水屏动画播放的实验与优化：以工作缓冲（WB）逐像
 内核来自独立的 Kindle 主线 Git 仓库，`kernel/mainline.lock` 锁定
 `refactor/k4-modularization` 分支上的提交 `27bb673d9e080a1ce90aae8160e68df232e1356c`。
 分支名用于说明来源，构建始终以完整提交为准。`kernel/patches/series` 顺序列出
-本仓库的 `git format-patch` 补丁，当前系列为空。实验代码与记录在本仓库独立维护。
+本仓库的 `git format-patch` 补丁，提供 EPDC WB 直驱会话接口。实验代码与记录在本仓库独立维护。
 
 构建脚本在指定输出目录的 `src` 创建 detached Git 工作树，以 `git am` 应用系列，
 随后调用该源码树的 `project/build.py`。相同提交与补丁系列可复用工作树；
@@ -35,13 +35,13 @@ HEAD、已应用系列或已跟踪文件不匹配时重建该工作树。
 
 主机脚本需要 bash、Python 3 标准库、ffmpeg（含 libx264、lavfi、v4l2）、ssh 和
 支持 `-N` 的 nc；构建用户态需要 `arm-linux-gnueabihf-gcc`、make 和主线的
-`include/uapi/linux/mxcfb.h`；测试需要 `qemu-arm-static`。
+`include/uapi/linux/mxcfb.h` 与补丁提供的 `include/uapi/linux/k4-epdc-wb.h`；测试需要 `qemu-arm-static`。
 内核还使用主线构建入口本身所需的 make、交叉 binutils、bison、flex、bc、
 开发头文件等主机构建依赖，详见主线 `project/docs/BUILD.md`。
 源码与工具应事先在本地准备，构建脚本没有下载步骤。
 
 设备需要匹配的 mxcfb 接口、已加载的面板波形、root 权限、`/dev/fb0`；
-WB 播放器和内存探针还需要 `/dev/mem` 可访问驱动的 DMA 内存。
+WB 播放器需要补丁提供的 `/dev/k4-epdc-wb`；内存探针需要 `/dev/mem`。
 固件、波形、相机原录像、密钥和设备身份由使用者在仓库外管理。
 
 ## 快速开始
@@ -78,8 +78,8 @@ bash host/make-demo.sh build/anim.raw anim
 
 ```bash
 bash host/play.sh --target root@host --player player/k4-wb \
-  --remote-player '<设备播放器路径>' --raw build/demo.raw --port 5000 -- 2 0
-# 自带参数：k4-wb PORT [extra=2] [LUT帧数=0(最大)]
+  --remote-player '<设备播放器路径>' --raw build/demo.raw --port 5000 -- 2
+# 自带参数：k4-wb PORT [extra=2]
 # A2 对照（须内核支持 SNAPSHOT）：k4-a2 PORT [depth=8] [waveform=4]
 bash host/play.sh --target root@host --player player/k4-a2 \
   --remote-player '<设备播放器路径>' --raw build/demo.raw --port 5000 \
@@ -108,10 +108,13 @@ python3 host/compare.py --video build/camera.mp4 --raw build/demo.raw \
 ## 当前限制
 
 锁定主线包含 Y8 快速路径、按原厂每 60 秒缓存的 Papyrus 温度和 UPDATE_SCHEME_SNAPSHOT，
-`k4-a2` 与 `k4-wb` 的 LUT 快速重启依赖这些主线功能。
+`k4-a2` 使用 mxcfb SNAPSHOT；`k4-wb` 使用补丁提供的 START/WAIT_FRAME/STOP 与 WB mmap，
+驱动自动重启固定 LUT，以 EOF 帧边界同步写入。
 
-WB 方案直接改写驱动 DMA 内存，驱动不知情；模式 3 数据区在实验后需要重启恢复。
-它没有直流平衡，温度推动参数只在启动时读取，长期残影和面板寿命影响未验证。
+WB 会话独占面板，普通 SEND_UPDATE 与前端自动刷新返回 EBUSY。STOP、最后一个 fd
+关闭及挂起会结束会话；STOP 撤销旧 WB 映射，访问它会产生 SIGBUS，下一次普通更新
+按整屏恢复历史。它没有直流平衡，温度推动参数只在启动时读取，长期残影和面板寿命
+影响未验证。
 `wvinfo` 直接读寄存器，调用前必须先保持 EPDC 上电；其它探针中的唤醒流程见源码。
 `epdc-timing` 按 32 位画布访问，必须在对应画布格式下使用。
 
