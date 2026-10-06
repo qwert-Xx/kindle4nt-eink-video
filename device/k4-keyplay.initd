@@ -1,0 +1,16 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: GPL-2.0-only
+# 按键控制的墨水屏视频播放：确认键播放/继续，主页键暂停并清屏。
+# 视频与播放器路径在 /etc/conf.d/k4-keyplay 中设置。
+
+description="Key-controlled e-ink video playback"
+command=/usr/local/bin/k4-keyplay
+command_args="${KEYPLAY_VIDEO} ${KEYPLAY_PLAYER:-/usr/local/bin/k4-wb}"
+command_background=true
+pidfile=/run/k4-keyplay.pid
+output_log=/var/log/k4-keyplay.log
+error_log=/var/log/k4-keyplay.log
+
+depend() {
+	after localmount
+}

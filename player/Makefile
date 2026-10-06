@@ -7,7 +7,7 @@ CFLAGS ?= -O3 -Wall -mcpu=cortex-a8 -mfpu=neon -mfloat-abi=hard -mno-unaligned-a
 CPPFLAGS += -idirafter $(KERNEL_SRC)/include/uapi
 LDFLAGS += -static -pthread
 
-PROGRAMS = k4-wb k4-a2
+PROGRAMS = k4-wb k4-a2 k4-keyplay
 TESTS = ../tests/test_k4wb ../tests/test_neon
 .PHONY: all test clean
 all: $(PROGRAMS)

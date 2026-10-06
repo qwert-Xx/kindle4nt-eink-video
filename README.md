@@ -79,7 +79,7 @@ bash host/make-demo.sh build/anim.raw anim
 ```bash
 bash host/play.sh --target root@host --player player/k4-wb \
   --remote-player '<设备播放器路径>' --raw build/demo.raw --port 5000 -- 2
-# 自带参数：k4-wb PORT [extra=2] [bias=40]
+# 自带参数：k4-wb [-w] PORT|- [extra=2] [bias=40]（- 为标准输入、按 30 fps 定节奏，-w 退出时刷白）
 # A2 对照（须内核支持 SNAPSHOT）：k4-a2 PORT [depth=8] [waveform=4]
 bash host/play.sh --target root@host --player player/k4-a2 \
   --remote-player '<设备播放器路径>' --raw build/demo.raw --port 5000 \
@@ -104,6 +104,14 @@ python3 host/compare.py --video build/camera.mp4 --raw build/demo.raw \
 互相关在 24×18 灰度图、默认 5 fps 上搜索，精度 0.2 秒，可用 `--sample-fps` 调整。
 输出 `offset_seconds` 满足 `camera[t + offset]` 对应 `raw[t]`；正值代表录像较晚。
 并排输出左为录像、右为原片，按偏移裁去开头并在较短输入结束时停止。
+
+## 按键播放（设备端）
+
+`player/k4-keyplay` 监听输入设备：确认键（K4 五向键中键，`KEY_F24`）开始或继续播放，
+主页键（`KEY_HOME`）暂停并清屏，再按确认键从暂停处继续，播完后下次从头开始。视频为
+gzip 压缩的 800×600 monob 原始帧（30 fps），由 `zcat | dd` 送入 `k4-wb -w -`。
+`device/k4-keyplay.initd` 与 `device/k4-keyplay.confd` 是对应的 OpenRC 服务及配置，安装为
+`/etc/init.d/k4-keyplay`、`/etc/conf.d/k4-keyplay` 后用 `rc-update add k4-keyplay default` 启用。
 
 ## 当前限制
 

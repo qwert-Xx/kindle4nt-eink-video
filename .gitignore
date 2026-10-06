@@ -19,3 +19,4 @@ tools/epdc-timing
 tests/test_k4wb
 tests/test_neon
 tools/wbcurve
+player/k4-keyplay

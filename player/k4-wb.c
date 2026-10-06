@@ -2,7 +2,10 @@
 /* WB 直驱：驱动拥有合成波形、LUT 重启与扫描同步；用户态在每个 EOF 后
  * 改写 mmap 工作缓冲。每像素一字节位置/目标/动作状态，16 像素 NEON 步进，
  * 漏帧按驱动累计帧差补算，重启后重写仍在推动的组。
- * 用法：k4-wb <tcp_port> [extra=2] [bias=40]
+ * 用法：k4-wb [-w] <tcp_port|-> [extra=2] [bias=40]
+ *   tcp_port：监听并接受一个 TCP 连接作为输入，由发送端控制节奏（如 ffmpeg -re）；
+ *   -：从标准输入读，按源帧率 30 fps 自行定节奏；
+ *   -w：退出时整屏刷白，否则按估计位置刷出最后画面。
  */
 #include <arm_neon.h>
 #include <fcntl.h>
@@ -67,6 +70,8 @@ static int extra, top, nps;
 /* 位置 margin 为黑端、margin+top 为白端；两侧余量保存漏帧时端点外多执行的推动，
  * 目标反转时一并推回，使净推动始终等于位置变化。 */
 static int margin;
+#define SOURCE_FPS 30
+static int pace_input, exit_white;
 /* 目标反转时可跳过补推区（不推动即离开端点），这会让净推动偏离位置变化；偏离量
  * 按像素记在 bias（净推动 − 位置变化），|bias| 不超过 bias_cap，到达上限后只能
  * 逐档推回。跳过使像素在端点附近往返时被拉回端点，抵消墨水响应不对称造成的漂移。 */
@@ -176,7 +181,7 @@ static void finish(void)
 	for (unsigned int y = 0; top && y < H; y++)
 		for (unsigned int x = 0; x < W; x++)
 			fb[(size_t)y * fix.line_length + x] =
-				(st[y * W + x] & S_LV) * 2 >= 2 * margin + top ? 0xff : 0x00;
+				exit_white || (st[y * W + x] & S_LV) * 2 >= 2 * margin + top ? 0xff : 0x00;
 	send_full(2);
 	wait_marker(marker);
 	if (var_changed && ioctl(fbfd, FBIOPUT_VSCREENINFO, &old_var))
@@ -213,7 +218,9 @@ static int open_input(int port)
 static void *reader(void *arg)
 {
 	static uint8_t buf[FRAME];
+	struct timespec due;
 	(void)arg;
+	clock_gettime(CLOCK_MONOTONIC, &due);
 	for (;;) {
 		size_t got = 0;
 		while (got < FRAME) {
@@ -225,6 +232,13 @@ static void *reader(void *arg)
 				return NULL;
 			}
 			got += n;
+		}
+		if (pace_input) {
+			/* 标准输入没有发送端节奏：第 i 帧在开始后 i/SOURCE_FPS 秒发布 */
+			clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &due, NULL);
+			due.tv_nsec += 1000000000L / SOURCE_FPS;
+			if (due.tv_nsec >= 1000000000L)
+				due.tv_sec++, due.tv_nsec -= 1000000000L;
 		}
 		pthread_mutex_lock(&lock);
 		memcpy(pending, buf, FRAME);
@@ -410,9 +424,12 @@ static void resync(void)
 
 int main(int argc, char **argv)
 {
+	if (argc > 1 && !strcmp(argv[1], "-w"))
+		exit_white = 1, argc--, argv++;
 	if (argc < 2)
-		return fprintf(stderr, "usage: k4-wb <tcp_port> [extra=2] [bias=40]\n"), 2;
-	int port = atoi(argv[1]);
+		return fprintf(stderr, "usage: k4-wb [-w] <tcp_port|-> [extra=2] [bias=40]\n"), 2;
+	pace_input = !strcmp(argv[1], "-");
+	int port = pace_input ? 0 : atoi(argv[1]);
 	extra = argc > 2 ? atoi(argv[2]) : 2;
 	bias_cap = argc > 3 ? atoi(argv[3]) : 40;
 	if (argc > 4 || extra < 0 || bias_cap < 0 || bias_cap > 127)
@@ -469,7 +486,7 @@ int main(int argc, char **argv)
 	memset(target_bits, 0xff, sizeof(target_bits));
 	fprintf(stderr, "A2 pushes %d, extra %d, LUT %u frames\n", nps, extra, wbinfo.frames_per_lut);
 
-	input_fd = open_input(port);
+	input_fd = pace_input ? STDIN_FILENO : open_input(port);
 	if (input_fd < 0)
 		return 1;
 	pthread_create(&th, NULL, reader, NULL);

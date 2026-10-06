@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# gzip 压缩的 800x600 monob 原始帧，30 fps
+KEYPLAY_VIDEO=/usr/local/share/k4-keyplay/video.raw.gz
+KEYPLAY_PLAYER=/usr/local/bin/k4-wb
