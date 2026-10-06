@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# 每行一个相对本目录的 git format-patch 文件名，按顺序 git am。
+# 空行和以 # 开头的注释忽略；当前没有补丁。

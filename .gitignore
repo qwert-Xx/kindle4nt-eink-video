@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0-only
+.work/
+build/
+out/
+__pycache__/
+*.pyc
+*.raw
+*.mp4
+*.mkv
+*.avi
+*.log
+player/k4-wb
+player/k4-a2
+tools/wbprobe
+tools/wbdrive
+tools/wvinfo
+tools/wbbench
+tools/epdc-timing
+tests/test_k4wb
+tests/test_neon
