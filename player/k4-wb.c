@@ -1,24 +1,16 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* WB 直驱播放器（实验）：一个长 LUT 跑整屏，每个扫描帧由软件改写 WB 目标色，
- * 逐像素逐帧决定推黑 / 推白 / 不动。
- *
- * 机制（i.MX50 RM 24.3.8）：EPDC 每帧从内存读 WB（每像素 16 位：[15:12] LUT，
- * [7:4] 目标色，[3:0] 当前色）并按 LUT 当前帧的 256 项动作表查 (目标<<4|当前)。
- * 这里把用户波形 2（GC16）在所有温度档的指针临时指向一张合成表：每帧都是
- * “目标 0 推黑、15 推白、其它不动”，帧数 F。画布整屏写 0x88，FULL 提交后整屏
- * 都在这个 LUT 里；之后不再提交更新，只写 WB。LUT 走完 F 帧后立即再提交一次。
- * 退出时还原指针并用真正的 GC16 刷一次当前画面。
- *
- * 每个像素有位置 0..top（0=黑，top=白，top=n+2*extra，n 为当前温度 A2 推动帧数），
- * 每帧朝目标走一步。以 16 像素为一组用 NEON 计算，只算还在动的组；
- * 帧计数翻转时把变化的组按 32 字节写进 WB。漏帧时按实际经过的帧数补算位置。
- *
- * 用法：k4-wb <tcp_port> [extra=2] [frames=0(最大)]
- * 只改内存（波形表、WB、画布），不改驱动；需要 /dev/mem 可访问 RAM。 */
+/* WB 直驱：驱动拥有合成波形、LUT 重启与扫描同步；用户态在每个 EOF 后
+ * 改写 mmap 工作缓冲。每像素一字节位置/目标/动作状态，16 像素 NEON 步进，
+ * 漏帧按驱动累计帧差补算，重启后重写仍在推动的组。
+ * 用法：k4-wb <tcp_port> [extra=2]
+ */
 #include <arm_neon.h>
 #include <fcntl.h>
 #include <linux/fb.h>
 #include <linux/mxcfb.h>
+#include <linux/k4-epdc-wb.h>
+#include <errno.h>
+#include <inttypes.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <sched.h>
@@ -33,7 +25,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#define EPDC_BASE 0x41010000
 #define W 800
 #define H 600
 #define NPIX (W * H)
@@ -43,19 +34,15 @@
 #define C_WHITE 0xf0
 #define C_HOLD 0x80
 #define WHEEL 64
-#define LUT_FRAMES_MAX 1023 /* EPDC_DEBUG_LUTn 帧计数 10 位 */
 
-static volatile uint32_t *reg;
-static uint8_t *wv;
 static volatile uint16_t *wb;
 static unsigned int stride;
 static int fbfd = -1;
-static int32_t old_delay;
+static int wbfd = -1, session;
+static struct k4_epdc_wb_info wbinfo;
+static volatile sig_atomic_t interrupted;
 static struct fb_var_screeninfo old_var;
 static int var_changed;
-static size_t tt2;
-static uint64_t saved2[64];
-static unsigned int ntemps, patched;
 static uint8_t *fb;
 static struct fb_fix_screeninfo fix;
 
@@ -82,7 +69,6 @@ static uint32_t dirty[NCH];
 static uint8_t staged[NCH][CH] __attribute__((aligned(16)));
 static uint16_t dirty_slot[NCH]; /* 组在写表中的位置 + 1，0 表示不在 */
 static unsigned int dirty_n;
-static uint16_t wbbase;
 static unsigned long writes;
 
 static double now(void)
@@ -90,25 +76,6 @@ static double now(void)
 	struct timespec t;
 	clock_gettime(CLOCK_MONOTONIC, &t);
 	return t.tv_sec + t.tv_nsec / 1e9;
-}
-
-static uint64_t le64(size_t off)
-{
-	uint64_t v;
-	memcpy(&v, wv + off, 8);
-	return v;
-}
-
-static void set64(size_t off, uint64_t v)
-{
-	memcpy(wv + off, &v, 8);
-}
-
-static void unpatch(void)
-{
-	for (unsigned int t = 0; patched && t < ntemps; t++)
-		set64(tt2 + t * 8, saved2[t]);
-	patched = 0;
 }
 
 static unsigned int marker = 10;
@@ -130,9 +97,7 @@ static void wait_marker(unsigned int mk)
 	ioctl(fbfd, MXCFB_WAIT_FOR_UPDATE_COMPLETE, &m);
 }
 
-static int active_lut = -1;
-
-/* 结束：等长 LUT 走完，还原波形指针，把位置画到画布上用真 GC16 刷一次 */
+/* STOP 撤销 WB 映射并等待驱动停止；以估计位置画布做一次 GC16 整屏恢复。 */
 static void finish(void)
 {
 	static int done;
@@ -141,12 +106,11 @@ static void finish(void)
 	if (done || fbfd < 0)
 		return;
 	done = 1;
-	if (active_lut >= 0)
-		for (unsigned int y = 0; y < H; y++)
-			for (unsigned int x = 0; x < W; x++)
-				wb[(size_t)y * stride + x] = (active_lut << 12) | C_HOLD | 8;
-	wait_marker(marker);
-	unpatch();
+	if (session) {
+		if (ioctl(wbfd, K4_EPDC_WB_STOP))
+			perror("WB STOP");
+		session = 0;
+	}
 	for (unsigned int y = 0; top && y < H; y++)
 		for (unsigned int x = 0; x < W; x++)
 			fb[(size_t)y * fix.line_length + x] =
@@ -156,13 +120,16 @@ static void finish(void)
 	if (var_changed && ioctl(fbfd, FBIOPUT_VSCREENINFO, &old_var))
 		perror("restore format");
 	ioctl(fbfd, MXCFB_SET_AUTO_UPDATE_MODE, &mode);
-	ioctl(fbfd, MXCFB_SET_PWRDOWN_DELAY, &old_delay);
+	if (wb && wb != MAP_FAILED)
+		munmap((void *)wb, wbinfo.size);
+	if (wbfd >= 0)
+		close(wbfd);
 }
 
 static void on_signal(int sig)
 {
 	(void)sig;
-	exit(0);
+	interrupted = 1;
 }
 
 static int open_input(int port)
@@ -265,7 +232,8 @@ static void compute(void)
 /* 帧计数翻转后立即写入：每组 16 像素扩成 16 位后两次 16 字节存储，并更新状态里的动作 */
 static void flush_list(void)
 {
-	const uint16x8_t base = vdupq_n_u16(wbbase);
+	const uint16x8_t hold = vdupq_n_u16(wbinfo.hold);
+	const uint16x8_t white = vdupq_n_u16(wbinfo.white), black = vdupq_n_u16(wbinfo.black);
 	const uint8x16_t vw = vdupq_n_u8(C_WHITE), z = vdupq_n_u8(0), mcur = vdupq_n_u8(S_CUR);
 	const uint8x16_t c1 = vdupq_n_u8(0x40), c2 = vdupq_n_u8(0x80);
 
@@ -274,8 +242,11 @@ static void flush_list(void)
 		uint8x16_t v = vld1q_u8(staged[i]);
 		uint16_t *d = (uint16_t *)wb + (size_t)(o / W) * stride + o % W;
 
-		vst1q_u16(d, vorrq_u16(vmovl_u8(vget_low_u8(v)), base));
-		vst1q_u16(d + 8, vorrq_u16(vmovl_u8(vget_high_u8(v)), base));
+		uint16x8_t low = vmovl_u8(vget_low_u8(v)), high = vmovl_u8(vget_high_u8(v));
+		vst1q_u16(d, vbslq_u16(vceqq_u16(low, vdupq_n_u16(C_WHITE)), white,
+			vbslq_u16(vceqq_u16(low, vdupq_n_u16(C_BLACK)), black, hold)));
+		vst1q_u16(d + 8, vbslq_u16(vceqq_u16(high, vdupq_n_u16(C_WHITE)), white,
+			vbslq_u16(vceqq_u16(high, vdupq_n_u16(C_BLACK)), black, hold)));
 		uint8x16_t k = vorrq_u8(vandq_u8(vceqq_u8(v, vw), c1), vandq_u8(vceqq_u8(v, z), c2));
 		uint8x16_t s0 = vld1q_u8(st + o);
 		vst1q_u8(st + o, vorrq_u8(vbicq_u8(s0, mcur), k));
@@ -323,16 +294,6 @@ static int take_target(unsigned long *last_seq, int *done)
 	return 1;
 }
 
-static int lut_frame(void)
-{
-	return (reg[(0x540 + 16 * active_lut) / 4] >> 5) & 0x3ff;
-}
-
-static int lut_running(void)
-{
-	return reg[0x440 / 4] & (1u << active_lut);
-}
-
 /* LUT 重启后 WB 目标色全是不动：下一帧要执行的动作（写表里的，或状态里正在执行的）
  * 不是不动的组全部写入 */
 static void resync(void)
@@ -356,54 +317,27 @@ static void resync(void)
 	flush_list();
 }
 
-/* 提交一次整屏长 LUT 并等它开始；处理把 WB 目标色全部写成画布的 8（不动），
- * 再把所有正在推动的像素重新写入 */
-static int start_lut(void)
-{
-	uint32_t before = reg[0x440 / 4] & 0xffff;
-	double t0 = now();
-
-	send_full(2);
-	active_lut = -1;
-	while (now() - t0 < 1.0) {
-		uint32_t l = reg[0x440 / 4] & 0xffff & ~before;
-		if (l) {
-			active_lut = __builtin_ctz(l);
-			break;
-		}
-		/* 提交由驱动的工作线程完成；实时线程须让出 CPU */
-		usleep(200);
-	}
-	if (active_lut < 0)
-		return -1;
-	wbbase = (active_lut << 12) | 8;
-	resync();
-	return 0;
-}
-
 int main(int argc, char **argv)
 {
 	if (argc < 2)
-		return fprintf(stderr, "usage: k4-wb <tcp_port> [extra=2] [frames=0(max)]\n"), 2;
+		return fprintf(stderr, "usage: k4-wb <tcp_port> [extra=2]\n"), 2;
 	int port = atoi(argv[1]);
 	extra = argc > 2 ? atoi(argv[2]) : 2;
-	unsigned int frames = argc > 3 ? atoi(argv[3]) : 0;
-	int mem = open("/dev/mem", O_RDWR | O_SYNC);
+	if (argc > 3 || extra < 0)
+		return fprintf(stderr, "invalid arguments\n"), 2;
 	struct fb_var_screeninfo var;
 	pthread_t th;
 
 	fbfd = open("/dev/fb0", O_RDWR);
-	if (mem < 0 || fbfd < 0 || ioctl(fbfd, FBIOGET_VSCREENINFO, &old_var) ||
-	    ioctl(fbfd, MXCFB_GET_PWRDOWN_DELAY, &old_delay))
+	if (fbfd < 0 || ioctl(fbfd, FBIOGET_VSCREENINFO, &old_var))
 		return perror("open"), 1;
-	int32_t no = -1;
 	unsigned int amode = AUTO_UPDATE_MODE_REGION_MODE;
-	ioctl(fbfd, MXCFB_SET_PWRDOWN_DELAY, &no);
 	ioctl(fbfd, MXCFB_SET_AUTO_UPDATE_MODE, &amode);
 	atexit(finish);
-	signal(SIGTERM, on_signal);
-	signal(SIGINT, on_signal);
-	/* Y8 画布：驱动 Y8 快速路径下整屏提交只需拷贝，LUT 重启快 */
+	struct sigaction sa = { .sa_handler = on_signal };
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGINT, &sa, NULL);
+	/* Y8 画布用于 GC16 起点和结束时的估计画面。 */
 	var = old_var;
 	var.bits_per_pixel = 8;
 	var.grayscale = 1;
@@ -414,63 +348,35 @@ int main(int argc, char **argv)
 	if (fb == MAP_FAILED)
 		return perror("mmap fb"), 1;
 
-	/* 起点：真 GC16 整屏刷白（同时唤醒 EPDC，之后才能读寄存器） */
+	/* 起点：真 GC16 整屏刷白。 */
 	for (unsigned int y = 0; y < H; y++)
 		memset(fb + (size_t)y * fix.line_length, 0xff, W);
 	send_full(2);
 	wait_marker(marker);
 
-	reg = mmap(NULL, 0x1000, PROT_READ, MAP_SHARED, mem, EPDC_BASE);
-	stride = ((reg[0x40 / 4] & 0x1fff) + 3) & ~3u;
-	wv = mmap(NULL, 2 << 20, PROT_READ | PROT_WRITE, MAP_SHARED, mem, reg[0x20 / 4]);
-	wb = mmap(NULL, ((size_t)stride * H * 2 + 4095) & ~4095ul, PROT_READ | PROT_WRITE,
-		  MAP_SHARED, mem, reg[0x30 / 4]);
-	if (reg == MAP_FAILED || wv == MAP_FAILED || wb == MAP_FAILED)
-		return perror("mmap"), 1;
-
-	/* 当前温度档 A2（硬件模式 4）的推动帧数与动作码 */
-	unsigned int temp = reg[0x1a0 / 4];
-	ntemps = (le64(le64(0)) - le64(0)) / 8;
-	size_t a2 = le64(le64(4 * 8) + temp * 8);
-	uint8_t black = 0, white = 0;
-	for (uint64_t f = 0; f < le64(a2); f++) {
-		const uint8_t *act = wv + a2 + 8 + f * 256;
-		if (!black)
-			black = act[0x0f];
-		if (!white)
-			white = act[0xf0];
-		nps += !!act[0xf0];
-	}
+	wbfd = open("/dev/k4-epdc-wb", O_RDWR);
+	double start_time = now();
+	if (wbfd < 0 || ioctl(wbfd, K4_EPDC_WB_START, &wbinfo))
+		return perror("WB START"), 1;
+	session = 1;
+	double t_start0 = now() - start_time;
+	if (wbinfo.width != W || wbinfo.height != H || wbinfo.stride < W ||
+	    wbinfo.size < (size_t)wbinfo.stride * H * 2)
+		return fprintf(stderr, "unsupported WB geometry\n"), 1;
+	stride = wbinfo.stride;
+	wb = mmap(NULL, wbinfo.size, PROT_READ | PROT_WRITE, MAP_SHARED, wbfd, 0);
+	if (wb == MAP_FAILED)
+		return perror("mmap WB"), 1;
+	nps = wbinfo.push_frames;
+	if (nps > S_LV || extra > (S_LV - nps) / 2)
+		return fprintf(stderr, "push/extra exceeds state bits\n"), 1;
 	top = nps + 2 * extra;
 	lo = extra;
 	hi = top - extra;
 
-	/* 合成表放在硬件模式 3 的数据区（用户波形号映射不到它） */
-	size_t base = le64(le64(3 * 8)), end = le64(4 * 8), room = (end - base - 8) / 256;
-	if (!frames)
-		frames = room < LUT_FRAMES_MAX ? room : LUT_FRAMES_MAX;
-	if (frames > LUT_FRAMES_MAX || frames > room)
-		return fprintf(stderr, "frames too many (room %zu)\n", room), 1;
-	uint8_t act[256];
-	for (unsigned int i = 0; i < 256; i++)
-		act[i] = (i >> 4) == 0 ? black : (i >> 4) == 15 ? white : 0;
-	set64(base, frames);
-	for (unsigned int f = 0; f < frames; f++)
-		memcpy(wv + base + 8 + (size_t)f * 256, act, 256);
-	tt2 = le64(2 * 8);
-	for (unsigned int t = 0; t < ntemps; t++)
-		saved2[t] = le64(tt2 + t * 8);
-	patched = 1;
-	for (unsigned int t = 0; t < ntemps; t++)
-		set64(tt2 + t * 8, base);
-
-	if (top > S_LV)
-		return fprintf(stderr, "top %d exceeds state bits\n", top), 1;
 	memset(st, top | S_TW, sizeof(st));
 	memset(target_bits, 0xff, sizeof(target_bits));
-	for (unsigned int y = 0; y < H; y++)
-		memset(fb + (size_t)y * fix.line_length, 0x88, W);
-	fprintf(stderr, "temp %u: A2 pushes %d, extra %d, LUT %u frames\n", temp, nps, extra, frames);
+	fprintf(stderr, "A2 pushes %d, extra %d, LUT %u frames\n", nps, extra, wbinfo.frames_per_lut);
 
 	input_fd = open_input(port);
 	if (input_fd < 0)
@@ -487,11 +393,12 @@ int main(int argc, char **argv)
 	int done = 0;
 	double t0 = now(), tcomp = 0, tmax = 0, tw = 0, twmax = 0, t_restart = 0, t_restart_max = 0;
 
-	if (start_lut())
-		return fprintf(stderr, "LUT did not start\n"), 1;
-	double t_start0 = now() - t0;
-	int prev = lut_frame();
-	uint32_t G = 0;
+	struct k4_epdc_wb_frame scan;
+	if (ioctl(wbfd, K4_EPDC_WB_WAIT_FRAME, &scan))
+		return perror("WAIT_FRAME"), 1;
+	uint64_t prev = scan.frame, G = 0;
+	uint32_t generation = scan.generation;
+	int failed = 0;
 	double p_cpu = 0, p_take = 0, p_comp = 0, p_comp_max = 0, p_take_max = 0;
 	unsigned long p_busy = 0, p_busy_at_max = 0;
 	used += take_target(&last_seq, &done);
@@ -531,51 +438,47 @@ int main(int argc, char **argv)
 		if (tb > tmax)
 			tmax = tb;
 		ticks++;
-		if (done)
+		if (done || interrupted)
 			break;
-		if (tb < 0.0095)
-			usleep((unsigned int)((0.0100 - tb) * 1e6));
-		int f;
-		while ((f = lut_frame()) == prev && lut_running())
-			;
-		if (!lut_running()) {
-			double tr = now();
-			wait_marker(marker);
-			restarts++;
-			if (start_lut())
-				return fprintf(stderr, "LUT restart failed\n"), 1;
-			prev = lut_frame();
-			tr = now() - tr;
-			t_restart += tr;
-			if (tr > t_restart_max)
-				t_restart_max = tr;
-			continue;
+		double tr = now();
+		if (ioctl(wbfd, K4_EPDC_WB_WAIT_FRAME, &scan)) {
+			if (errno != EINTR || !interrupted) {
+				perror("WAIT_FRAME");
+				failed = 1;
+			}
+			break;
 		}
-		int d = (prev - f + 1024) % 1024, e = (f - prev + 1024) % 1024;
-		int step = d < e ? d : e;
+		uint64_t step = scan.frame - prev;
 		if (step > 1) {
 			lost += step - 1;
 			if (tb > 0.0110)
 				lost_compute += step - 1;
-			/* WB 里的动作多执行了 step-1 帧，补进位置；已算好的下一帧动作照写，
-			 * 到端点的像素最多多推一帧 */
-			catch_up(step - 1);
+			catch_up(step > 32 ? 31 : step - 1);
+		}
+		if (scan.generation != generation) {
+			restarts += scan.generation - generation;
+			generation = scan.generation;
+			resync();
+			tr = now() - tr;
+			t_restart += tr;
+			if (tr > t_restart_max)
+				t_restart_max = tr;
 		}
 		G += step;
-		prev = f;
+		prev = scan.frame;
 	}
 	double dt = now() - t0;
 	fprintf(stderr, "take_target mean %.2fms max %.2fms; compute mean %.2fms max %.2fms (busy groups at max %lu); mean busy groups %.0f of %d\n",
 		1e3 * p_take / ticks, 1e3 * p_take_max, 1e3 * p_comp / ticks, 1e3 * p_comp_max, p_busy_at_max,
 		(double)p_busy / ticks, NCH);
 	fprintf(stderr, "compute thread cpu mean %.2fms\n", 1e3 * p_cpu / ticks);
-	fprintf(stderr, "video frames used %lu, ticks %lu in %.1fs = %.1f/s, LUT frames %u\n"
+	fprintf(stderr, "video frames used %lu, ticks %lu in %.1fs = %.1f/s, LUT frames %" PRIu64 "\n"
 		"write mean %.2fms max %.2fms, write+compute mean %.2fms max %.2fms\n"
-		"frames lost %lu (compute >11ms: %lu), first LUT start %.1fms, restarts %lu (%.1fms total, max %.1fms)\n"
+		"frames lost %lu (compute >11ms: %lu), first LUT start %.1fms, restarts %lu (boundary wait %.1fms total, max %.1fms)\n"
 		"WB 16-pixel group writes %lu\n",
 		used, ticks, dt, ticks / dt, G,
 		1e3 * tw / ticks, 1e3 * twmax, 1e3 * tcomp / ticks, 1e3 * tmax,
 		lost, lost_compute, 1e3 * t_start0, restarts, 1e3 * t_restart, 1e3 * t_restart_max,
 		writes);
-	return 0;
+	return failed;
 }
