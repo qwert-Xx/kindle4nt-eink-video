@@ -393,7 +393,8 @@ int main(int argc, char **argv)
 	int done = 0;
 	double t0 = now(), tcomp = 0, tmax = 0, tw = 0, twmax = 0, t_restart = 0, t_restart_max = 0;
 
-	struct k4_epdc_wb_frame scan;
+	/* 每次 START 后游标清零；后续 ioctl 原样传回上次的 frame/generation。 */
+	struct k4_epdc_wb_frame scan = {0};
 	if (ioctl(wbfd, K4_EPDC_WB_WAIT_FRAME, &scan))
 		return perror("WAIT_FRAME"), 1;
 	uint64_t prev = scan.frame, G = 0;
@@ -440,7 +441,10 @@ int main(int argc, char **argv)
 		ticks++;
 		if (done || interrupted)
 			break;
-		double tr = now();
+		double tr;
+wait_frame:
+		tr = now();
+		/* 计算期间已有 EOF 时立即取得进度，不再多等待一个扫描帧。 */
 		if (ioctl(wbfd, K4_EPDC_WB_WAIT_FRAME, &scan)) {
 			if (errno != EINTR || !interrupted) {
 				perror("WAIT_FRAME");
@@ -466,6 +470,9 @@ int main(int argc, char **argv)
 		}
 		G += step;
 		prev = scan.frame;
+		/* 仅 generation 变化时 resync 后继续等待，不多算一次位置步。 */
+		if (!step)
+			goto wait_frame;
 	}
 	double dt = now() - t0;
 	fprintf(stderr, "take_target mean %.2fms max %.2fms; compute mean %.2fms max %.2fms (busy groups at max %lu); mean busy groups %.0f of %d\n",
