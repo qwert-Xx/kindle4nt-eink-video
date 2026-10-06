@@ -8,7 +8,7 @@ Kindle 4 墨水屏动画播放的实验与优化：以工作缓冲（WB）逐像
 ## 与主线的关系
 
 内核来自独立的 Kindle 主线 Git 仓库，`kernel/mainline.lock` 锁定
-`refactor/k4-modularization` 分支上的提交 `5fec5b15368aad94c0434c2e18588a0593a72159`。
+`refactor/k4-modularization` 分支上的提交 `27bb673d9e080a1ce90aae8160e68df232e1356c`。
 分支名用于说明来源，构建始终以完整提交为准。`kernel/patches/series` 顺序列出
 本仓库的 `git format-patch` 补丁，当前系列为空。实验代码与记录在本仓库独立维护。
 
@@ -107,17 +107,14 @@ python3 host/compare.py --video build/camera.mp4 --raw build/demo.raw \
 
 ## 当前限制
 
-锁定主线只支持 QUEUE/QUEUE_AND_MERGE，SNAPSHOT 返回 `-EINVAL`；
-因此 `k4-a2` 的 SNAPSHOT 对照需要对应内核补丁才能实现该实验语义。
-锁定提交没有研究分支的 Y8 快速路径和温度缓存，WB 重启延迟应以实际设备为准。
-补丁系列为空表示构建主线本身，不含研究分支的这些优化。
+锁定主线包含 Y8 快速路径、按原厂每 60 秒缓存的 Papyrus 温度和 UPDATE_SCHEME_SNAPSHOT，
+`k4-a2` 与 `k4-wb` 的 LUT 快速重启依赖这些主线功能。
 
 WB 方案直接改写驱动 DMA 内存，驱动不知情；模式 3 数据区在实验后需要重启恢复。
 它没有直流平衡，温度推动参数只在启动时读取，长期残影和面板寿命影响未验证。
 `wvinfo` 直接读寄存器，调用前必须先保持 EPDC 上电；其它探针中的唤醒流程见源码。
 `epdc-timing` 按 32 位画布访问，必须在对应画布格式下使用。
 
-QEMU 对拍与交叉构建属于主机验证，历史设备数据见实验记录。
-本仓库初始化未执行设备播放、相机采集、冷启动或长时间面板验证。
+QEMU 对拍与交叉构建属于主机验证，设备数据见实验记录。
 
 代码与脚本采用 GPL-2.0-only，文档采用 CC-BY-4.0；许可文本见 `LICENSES/`。
