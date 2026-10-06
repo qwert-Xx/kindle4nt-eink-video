@@ -107,9 +107,10 @@ python3 host/compare.py --video build/camera.mp4 --raw build/demo.raw \
 
 ## 按键播放（设备端）
 
-`player/k4-keyplay` 监听输入设备：确认键（K4 五向键中键，`KEY_F24`）开始或继续播放，
-主页键（`KEY_HOME`）暂停并清屏，再按确认键从暂停处继续，播完后下次从头开始。视频为
-gzip 压缩的 800×600 monob 原始帧（30 fps），由 `zcat | dd` 送入 `k4-wb -w -`。
+`player/k4-keyplay` 监听输入设备：确认键（K4 五向键中键，`KEY_F24`）在停止时从头播放、
+播放中暂停（画面停在当前帧）、暂停时继续；主页键（`KEY_HOME`）停止播放并清屏，回到开头。
+视频为 gzip 压缩的 800×600 monob 原始帧（30 fps），由 `zcat` 送入 `k4-wb -w -`；暂停冻结
+解压进程，播放器按输入节奏停在当前画面。停止需等当前 LUT 走完（最长约 12 秒）才能清屏。
 `device/k4-keyplay.initd` 与 `device/k4-keyplay.confd` 是对应的 OpenRC 服务及配置，安装为
 `/etc/init.d/k4-keyplay`、`/etc/conf.d/k4-keyplay` 后用 `rc-update add k4-keyplay default` 启用。
 

@@ -234,7 +234,13 @@ static void *reader(void *arg)
 			got += n;
 		}
 		if (pace_input) {
-			/* 标准输入没有发送端节奏：第 i 帧在开始后 i/SOURCE_FPS 秒发布 */
+			/* 标准输入没有发送端节奏：每 1/SOURCE_FPS 秒发布一帧。输入停顿（如上游暂停）
+			 * 超过一帧时从当前时刻重新计时，恢复后不追帧。 */
+			struct timespec t;
+			clock_gettime(CLOCK_MONOTONIC, &t);
+			if ((t.tv_sec - due.tv_sec) * 1000000000L + (t.tv_nsec - due.tv_nsec) >
+			    1000000000L / SOURCE_FPS)
+				due = t;
 			clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &due, NULL);
 			due.tv_nsec += 1000000000L / SOURCE_FPS;
 			if (due.tv_nsec >= 1000000000L)

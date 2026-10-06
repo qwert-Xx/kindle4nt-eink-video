@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* 按键控制播放：确认键（K4 五向键中键，KEY_F24）开始或继续，主页键（KEY_HOME）暂停并
- * 清屏，再按确认键从暂停处继续；播完后下次从头开始。
- * 视频为 gzip 压缩的 800x600 monob 原始帧（每帧 60000 字节，30 fps），解压后经
- * dd 跳过已播帧送入 k4-wb 标准输入；暂停时给播放器 SIGTERM，等它停止 WB 会话并刷白。
+/* 按键控制播放：确认键（K4 五向键中键，KEY_F24）在停止时从头播放，播放中暂停（画面停在
+ * 当前帧），暂停时继续；主页键（KEY_HOME）停止播放、清屏并回到开头。播完后回到停止状态。
+ * 视频为 gzip 压缩的 800x600 monob 原始帧（每帧 60000 字节，30 fps），由 zcat 送入
+ * k4-wb 标准输入。暂停冻结解压进程组，播放器收不到新帧而保持当前画面；停止时给播放器
+ * SIGTERM，等它停止 WB 会话并刷白。
  * 用法：k4-keyplay <video.raw.gz> <k4-wb 路径> */
 #include <dirent.h>
 #include <errno.h>
@@ -22,20 +23,9 @@
 #include <time.h>
 #include <unistd.h>
 
-#define FRAME_BYTES 60000
-#define FPS 30
 #define PLAY_KEY KEY_F24
 #define STOP_KEY KEY_HOME
-/* 播放器启动到开始读帧（整屏 GC16 刷白与 START）约 1 秒，不计入播放位置 */
-#define START_DELAY_S 1.0
 #define MAX_INPUTS 8
-
-static double now(void)
-{
-	struct timespec t;
-	clock_gettime(CLOCK_MONOTONIC, &t);
-	return t.tv_sec + t.tv_nsec / 1e9;
-}
 
 /* 整屏写白并以 GC16 刷新 */
 static void clear_white(void)
@@ -86,9 +76,16 @@ static int open_inputs(struct pollfd *pfd)
 }
 
 static pid_t feeder = -1, player = -1;
+static volatile sig_atomic_t quit;
+
+static void on_term(int sig)
+{
+	(void)sig;
+	quit = 1;
+}
 
 /* 解压进程组写管道，播放器从管道读 */
-static void start(const char *video, const char *bin, long skip)
+static void start(const char *video, const char *bin)
 {
 	int pp[2];
 
@@ -101,7 +98,7 @@ static void start(const char *video, const char *bin, long skip)
 		dup2(pp[1], STDOUT_FILENO);
 		close(pp[0]);
 		close(pp[1]);
-		snprintf(cmd, sizeof(cmd), "zcat '%s' | dd bs=%d skip=%ld 2>/dev/null", video, FRAME_BYTES, skip);
+		snprintf(cmd, sizeof(cmd), "exec zcat '%s'", video);
 		execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
 		_exit(127);
 	}
@@ -124,7 +121,9 @@ static void stop(void)
 		waitpid(player, NULL, 0);
 	}
 	if (feeder > 0) {
+		/* 暂停中的进程组先恢复，才能处理 SIGTERM */
 		kill(-feeder, SIGTERM);
+		kill(-feeder, SIGCONT);
 		waitpid(feeder, NULL, 0);
 	}
 	player = feeder = -1;
@@ -136,26 +135,29 @@ int main(int argc, char **argv)
 		return fprintf(stderr, "usage: k4-keyplay <video.raw.gz> <k4-wb>\n"), 2;
 	struct pollfd pfd[MAX_INPUTS];
 	int n = open_inputs(pfd);
-	long pos = 0;
-	double started = 0;
+	int paused = 0;
 
 	if (!n)
 		return fprintf(stderr, "no input devices\n"), 1;
 	signal(SIGPIPE, SIG_IGN);
+	/* 服务停止时先结束播放，播放器才能停止 WB 会话并恢复设置 */
+	struct sigaction sa = { .sa_handler = on_term };
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGINT, &sa, NULL);
 	clear_white();
 	fprintf(stderr, "ready: %d input devices\n", n);
 	for (;;) {
 		if (poll(pfd, n, 500) < 0 && errno != EINTR)
 			return perror("poll"), 1;
-		/* 播完：下次从头开始 */
+		if (quit) {
+			stop();
+			return 0;
+		}
+		/* 播完：回到停止状态 */
 		if (player > 0 && waitpid(player, NULL, WNOHANG) == player) {
 			player = -1;
-			if (feeder > 0) {
-				kill(-feeder, SIGTERM);
-				waitpid(feeder, NULL, 0);
-				feeder = -1;
-			}
-			pos = 0;
+			stop();
+			paused = 0;
 			fprintf(stderr, "finished\n");
 		}
 		for (int i = 0; i < n; i++) {
@@ -164,16 +166,22 @@ int main(int argc, char **argv)
 				continue;
 			if (ev.type != EV_KEY || ev.value != 1)
 				continue;
-			if (ev.code == PLAY_KEY && player < 0) {
-				fprintf(stderr, "play from frame %ld\n", pos);
-				start(argv[1], argv[2], pos);
-				started = now();
-			} else if (ev.code == STOP_KEY && player > 0) {
-				double played = now() - started - START_DELAY_S;
-				stop();
-				if (played > 0)
-					pos += (long)(played * FPS);
-				fprintf(stderr, "paused at frame %ld\n", pos);
+			if (ev.code == PLAY_KEY) {
+				if (player < 0) {
+					fprintf(stderr, "play\n");
+					start(argv[1], argv[2]);
+				} else {
+					kill(-feeder, paused ? SIGCONT : SIGSTOP);
+					paused = !paused;
+					fprintf(stderr, paused ? "pause\n" : "resume\n");
+				}
+			} else if (ev.code == STOP_KEY) {
+				if (player > 0)
+					stop();
+				else
+					clear_white();
+				paused = 0;
+				fprintf(stderr, "stop\n");
 			}
 		}
 	}
