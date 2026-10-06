@@ -7,7 +7,7 @@ static uint8_t rlv[NPIX], rtl[NPIX], rout[NPIX];
 static uint16_t fakewb[NPIX];
 int main(void)
 {
-	extra = 2; nps = 9; top = nps + 2 * extra; lo = extra; hi = top - extra;
+	extra = 2; nps = 9; top = nps + 2 * extra;
 	wb = fakewb; stride = W; wbinfo = (struct k4_epdc_wb_info){ .hold=0x5783, .black=0x5003, .white=0x50f3 };
 	memset(st, top | S_TW, sizeof(st));
 	memset(target_bits, 0xff, sizeof(target_bits));
@@ -48,9 +48,7 @@ int main(void)
 		}
 		flush_list();
 		for (int i = 0; i < NPIX; i++) {
-			uint8_t m = -(uint8_t)(rtl[i] != 0), p = rlv[i];
-			uint8_t pw = p < lo ? lo : p, pb = p > hi ? hi : p;
-			p = (pw & m) | (pb & ~m);
+			uint8_t p = rlv[i];
 			uint8_t up = -(uint8_t)(p < rtl[i]), down = -(uint8_t)(p > rtl[i]);
 			rlv[i] = p + (up & 1) - (down & 1);
 			rout[i] = (up & C_WHITE) | (~(up | down) & C_HOLD);

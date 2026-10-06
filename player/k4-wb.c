@@ -63,7 +63,7 @@ static int input_fd;
 static uint8_t st[NPIX] __attribute__((aligned(64)));
 static uint8_t target_bits[FRAME];
 static uint8_t busy[NCH];
-static int extra, top, lo, hi, nps;
+static int extra, top, nps;
 
 /* 下一帧要写的组与它们的 WB 目标色（每组 16 字节） */
 static uint32_t dirty[NCH];
@@ -239,10 +239,11 @@ static void catch_up(unsigned int k)
 }
 
 /* 算下一帧：每组一步（NEON）；动作变化的组把新目标色放入写表；整组不动且 WB 里
- * 也是不动时转为空闲。两端各 extra 档是补推区；目标反转时先跳出补推区，从端点立即反向。 */
+ * 也是不动时转为空闲。两端各 extra 档是补推区。目标反转时从当前位置逐档推回，
+ * 不跳过补推区：每次推动都改变位置，净推动始终等于位置变化，直流不累积。 */
 static void compute(void)
 {
-	const uint8x16_t vlo = vdupq_n_u8(lo), vhi = vdupq_n_u8(hi), vtop = vdupq_n_u8(top);
+	const uint8x16_t vtop = vdupq_n_u8(top);
 	const uint8x16_t mlv = vdupq_n_u8(S_LV), mtw = vdupq_n_u8(S_TW), mkeep = vdupq_n_u8(S_TW | S_CUR);
 	const uint8x16_t white = vdupq_n_u8(C_WHITE), hold = vdupq_n_u8(C_HOLD);
 	const uint8x16_t one = vdupq_n_u8(1), two = vdupq_n_u8(2);
@@ -259,7 +260,6 @@ static void compute(void)
 			uint8x16_t s0 = vld1q_u8(a);
 			uint8x16_t p = vandq_u8(s0, mlv), tm = vtstq_u8(s0, mtw), t = vandq_u8(tm, vtop);
 			uint8x16_t cu = vshrq_n_u8(s0, 6);
-			p = vbslq_u8(tm, vmaxq_u8(p, vlo), vminq_u8(p, vhi));
 			uint8x16_t up = vcltq_u8(p, t), down = vcgtq_u8(p, t);
 			/* up/down 为 0xff（-1）：p - up + down 即走一步 */
 			p = vaddq_u8(vsubq_u8(p, up), down);
@@ -421,8 +421,6 @@ int main(int argc, char **argv)
 	if (nps > S_LV || extra > (S_LV - nps) / 2)
 		return fprintf(stderr, "push/extra exceeds state bits\n"), 1;
 	top = nps + 2 * extra;
-	lo = extra;
-	hi = top - extra;
 
 	memset(st, top | S_TW, sizeof(st));
 	memset(target_bits, 0xff, sizeof(target_bits));
