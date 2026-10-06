@@ -96,6 +96,9 @@ munmap，新会话重新 mmap。已打开的设备文件保持已停止核心对
 
 计算线程申请 `SCHED_FIFO` 优先级 50 和 `mlockall(MCL_CURRENT | MCL_FUTURE)`，
 接收线程保持普通调度。失败会打印错误并继续运行。计算完成后阻塞等待 WAIT_FRAME。
+播放期间每个 cpufreq 策略的 `scaling_min_freq` 设为 `scaling_max_freq`，退出时恢复：
+等待帧边界时 CPU 空闲，按需调频会降到低档，大面积变化到来时升频滞后导致漏帧
+（A 机 160/800 MHz，漏帧 77 → 0，见实验记录）。被 SIGKILL 结束时不会恢复，需手动写回。
 
 播放器保留 take_target、compute 的平均/最大耗时、计算线程 CPU 耗时、忙组数量、
 写入平均/最大耗时、每秒决策数、漏帧与计算超时归因、首次 START 耗时、重启次数及观察到重启时的帧边界等待耗时，

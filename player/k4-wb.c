@@ -6,6 +6,7 @@
  */
 #include <arm_neon.h>
 #include <fcntl.h>
+#include <glob.h>
 #include <linux/fb.h>
 #include <linux/mxcfb.h>
 #include <linux/k4-epdc-wb.h>
@@ -97,6 +98,54 @@ static void wait_marker(unsigned int mk)
 	ioctl(fbfd, MXCFB_WAIT_FOR_UPDATE_COMPLETE, &m);
 }
 
+/* 播放期间每个 cpufreq 策略的最低频率设为其最高频率。等待帧边界时 CPU 空闲，
+ * 按需调频会降到低档；大面积变化时升频来不及，计算和写入随之变慢而漏帧。 */
+static glob_t cpufreq;
+static char cpufreq_saved[16][32];
+
+static int sysfs_rw(const char *dir, const char *name, char *buf, size_t len, int write_it)
+{
+	char path[256];
+	int fd, n;
+
+	snprintf(path, sizeof(path), "%s/%s", dir, name);
+	fd = open(path, write_it ? O_WRONLY : O_RDONLY);
+	if (fd < 0)
+		return -1;
+	n = write_it ? write(fd, buf, strlen(buf)) : read(fd, buf, len - 1);
+	close(fd);
+	if (n < 0)
+		return -1;
+	if (!write_it)
+		buf[n] = 0;
+	return 0;
+}
+
+static void cpufreq_hold_max(void)
+{
+	char max[32];
+
+	if (glob("/sys/devices/system/cpu/cpufreq/policy*", 0, NULL, &cpufreq))
+		return;
+	for (size_t i = 0; i < cpufreq.gl_pathc && i < 16; i++) {
+		const char *d = cpufreq.gl_pathv[i];
+
+		if (sysfs_rw(d, "scaling_min_freq", cpufreq_saved[i], sizeof(cpufreq_saved[i]), 0) ||
+		    sysfs_rw(d, "scaling_max_freq", max, sizeof(max), 0) ||
+		    sysfs_rw(d, "scaling_min_freq", max, sizeof(max), 1)) {
+			fprintf(stderr, "cpufreq: cannot hold %s at maximum\n", d);
+			cpufreq_saved[i][0] = 0;
+		}
+	}
+}
+
+static void cpufreq_restore(void)
+{
+	for (size_t i = 0; i < cpufreq.gl_pathc && i < 16; i++)
+		if (cpufreq_saved[i][0])
+			sysfs_rw(cpufreq.gl_pathv[i], "scaling_min_freq", cpufreq_saved[i], 0, 1);
+}
+
 /* STOP 撤销 WB 映射并等待驱动停止；以估计位置画布做一次 GC16 整屏恢复。 */
 static void finish(void)
 {
@@ -124,6 +173,7 @@ static void finish(void)
 		munmap((void *)wb, wbinfo.size);
 	if (wbfd >= 0)
 		close(wbfd);
+	cpufreq_restore();
 }
 
 static void on_signal(int sig)
@@ -382,6 +432,7 @@ int main(int argc, char **argv)
 	if (input_fd < 0)
 		return 1;
 	pthread_create(&th, NULL, reader, NULL);
+	cpufreq_hold_max();
 	/* 计算线程用实时调度，只让中断打断；接收线程保持普通优先级。锁定内存避免缺页 */
 	struct sched_param sp = { .sched_priority = 50 };
 	if (sched_setscheduler(0, SCHED_FIFO, &sp))
