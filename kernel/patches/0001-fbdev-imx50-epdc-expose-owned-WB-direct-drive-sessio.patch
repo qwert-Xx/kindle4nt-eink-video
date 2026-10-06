@@ -1,4 +1,4 @@
-From d778b0dc2ec3201bf4eb55cdcac942dd64baaa2d Mon Sep 17 00:00:00 2001
+From 34b8c5e7cde7dbcf03932db2d89617eed348f854 Mon Sep 17 00:00:00 2001
 From: qwert-Xx <128706845+qwert-Xx@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 10:19:30 +0800
 Subject: [PATCH] fbdev: imx50-epdc: expose owned WB direct-drive sessions
@@ -7,37 +7,63 @@ Reserve a private synthetic waveform DMA table, derive A2 electrode actions at s
 
 Separate mmap inode references from device fd ownership and revoke mappings before draining STOP. Restore full canvas history, including SNAPSHOT capture, after STOP; stop on last fd close, suspend and removal. Keep stopped core objects alive for outstanding device files.
 
-Host ASan/UBSan image, pipeline (49/50 DMA debug scenarios), framebuffer, waveform, PxP and Papyrus power tests pass. ARM EPDC objects compile. Physical EOF timing and panel behavior require device validation.
+Derive the exposed WB layout from buffer dimensions, roundup4 pitch and allocated bytes. Share named LUT/color/frame constants between fixed submissions, pixels and frame accounting. Register ioctl type 0xB8, commands 00-1F, for this UAPI.
+
+Host ASan/UBSan image, pipeline (53/54 DMA debug scenarios), framebuffer, waveform, PxP and Papyrus power tests pass, including alternate panel sizes, padded stride and ioctl allocation. Physical EOF timing and panel behavior require device validation.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- drivers/video/fbdev/imx50-epdc-buffer.c |  71 +++++
- drivers/video/fbdev/imx50-epdc-hw.c     |  46 ++-
- drivers/video/fbdev/imx50-epdc-hw.h     |   8 +
- drivers/video/fbdev/imx50-epdc.c        | 407 +++++++++++++++++++++++-
- include/linux/imx50-epdc-buffer.h       |   9 +
- include/uapi/linux/k4-epdc-wb.h         |  27 ++
- porting/epdc-multi-lut-stub.h           |  50 +++
- porting/test-epdc-pipeline.py           | 128 +++++++-
- porting/test-epdc-waveform.py           |   1 -
- project/docs/DISPLAY.md                 |  25 ++
- 10 files changed, 754 insertions(+), 18 deletions(-)
+ .../userspace-api/ioctl/ioctl-number.rst      |   1 +
+ drivers/video/fbdev/imx50-epdc-buffer.c       |  90 +++-
+ drivers/video/fbdev/imx50-epdc-hw.c           |  48 ++-
+ drivers/video/fbdev/imx50-epdc-hw.h           |   8 +
+ drivers/video/fbdev/imx50-epdc.c              | 405 +++++++++++++++++-
+ include/linux/imx50-epdc-buffer.h             |  21 +
+ include/uapi/linux/k4-epdc-wb.h               |  27 ++
+ porting/epdc-multi-lut-stub.h                 |  50 +++
+ porting/test-epdc-pipeline.py                 | 163 ++++++-
+ porting/test-epdc-waveform.py                 |   3 +-
+ project/docs/DISPLAY.md                       |  25 ++
+ 11 files changed, 821 insertions(+), 20 deletions(-)
  create mode 100644 include/uapi/linux/k4-epdc-wb.h
 
+diff --git a/Documentation/userspace-api/ioctl/ioctl-number.rst b/Documentation/userspace-api/ioctl/ioctl-number.rst
+index 264faaa9d..d6eef5d96 100644
+--- a/Documentation/userspace-api/ioctl/ioctl-number.rst
++++ b/Documentation/userspace-api/ioctl/ioctl-number.rst
+@@ -354,6 +354,7 @@ Code  Seq#    Include File                                             Comments
+ 0xB6  all    linux/fpga-dfl.h
+ 0xB7  all    uapi/linux/remoteproc_cdev.h                              <mailto:linux-remoteproc@vger.kernel.org>
+ 0xB7  all    uapi/linux/nsfs.h                                         <mailto:Andrei Vagin <avagin@openvz.org>>
++0xB8  00-1F  uapi/linux/k4-epdc-wb.h                                   K4 EPDC WB direct-drive sessions
+ 0xC0  00-0F  linux/usb/iowarrior.h
+ 0xCA  00-0F  uapi/misc/cxl.h
+ 0xCA  10-2F  uapi/misc/ocxl.h
 diff --git a/drivers/video/fbdev/imx50-epdc-buffer.c b/drivers/video/fbdev/imx50-epdc-buffer.c
-index 91ac55e23..0df0711c7 100644
+index 91ac55e23..d5cc741e0 100644
 --- a/drivers/video/fbdev/imx50-epdc-buffer.c
 +++ b/drivers/video/fbdev/imx50-epdc-buffer.c
-@@ -6,6 +6,8 @@
+@@ -6,6 +6,9 @@
  #include <linux/imx50-epdc-buffer.h>
  #include <linux/imx50-epdc-image.h>
  #include <linux/module.h>
 +#include <linux/mm.h>
++#include <uapi/linux/k4-epdc-wb.h>
 +#include <asm/unaligned.h>
  #include <linux/overflow.h>
  #include <linux/slab.h>
  
-@@ -298,6 +300,75 @@ int imx50_epdc_buffers_invalidate(struct imx50_epdc_buffers *b)
+@@ -96,7 +99,8 @@ struct imx50_epdc_buffers *imx50_epdc_buffers_alloc(struct device *dev,
+ 	    !width || !height || width > EPDC_RES_MAX || height > EPDC_RES_MAX || (width & 3) ||
+ 	    !modes || modes > 256 || !temperatures || temperatures > 256)
+ 		return ERR_PTR(-EINVAL);
+-	if (check_mul_overflow((size_t)width * 2, (size_t)height, &work_bytes) ||
++	if (check_mul_overflow((size_t)ALIGN(width, 4) * sizeof(u16),
++			       (size_t)height, &work_bytes) ||
+ 	    check_mul_overflow((size_t)ALIGN(width, 8), (size_t)height, &update_bytes))
+ 		return ERR_PTR(-EOVERFLOW);
+ 	b = kzalloc(sizeof(*b), GFP_KERNEL);
+@@ -298,6 +302,90 @@ int imx50_epdc_buffers_invalidate(struct imx50_epdc_buffers *b)
  	return 0;
  }
  
@@ -74,10 +100,25 @@ index 91ac55e23..0df0711c7 100644
 +	return *black && *white ? 0 : -ENODATA;
 +}
 +
++void imx50_epdc_buffers_wb_info(struct imx50_epdc_buffers *b,
++	struct k4_epdc_wb_info *info)
++{
++	/* RM 24.3.8.1: WB scan pitch is roundup4(horizontal) 16-bit pixels. */
++	*info = (struct k4_epdc_wb_info) {
++		.width = b->width, .height = b->height,
++		.stride = ALIGN(b->width, 4), .size = b->work.bytes,
++		.hold = IMX50_EPDC_WB_PIXEL(IMX50_EPDC_WB_HOLD_COLOR),
++		.black = IMX50_EPDC_WB_PIXEL(0), .white = IMX50_EPDC_WB_PIXEL(15),
++		.frames_per_lut = IMX50_EPDC_WB_FRAMES,
++	};
++}
++
 +void imx50_epdc_buffers_wb_command(struct imx50_epdc_buffers *b,
 +	u32 waveform_addr, struct imx50_epdc_command *c)
 +{
-+	/* RM 24.4.10/11: USE_FIXED, FIXCP/NP=0x88, FULL and LUT0.
++	u32 fixed_gray = IMX50_EPDC_WB_HOLD_COLOR * 0x11;
++
++	/* RM 24.4.10/11: USE_FIXED, FIXCP/NP in Y8, FULL and the session LUT.
 +	 * Both colors are fixed so previous WB targets cannot affect startup.
 +	 */
 +	*c = (struct imx50_epdc_command) {
@@ -85,8 +126,8 @@ index 91ac55e23..0df0711c7 100644
 +		.working_addr = b->work.dma + EPDC_GUARD,
 +		.resolution = b->width | (b->height << 16),
 +		.size = b->width | (b->height << 16),
-+		.fixed = 0xc0008888,
-+		.control = BIT(31) | (1 << 8) | 1,
++		.fixed = BIT(31) | BIT(30) | (fixed_gray << 8) | fixed_gray,
++		.control = BIT(31) | (IMX50_EPDC_WB_LUT << 16) | (1 << 8) | 1,
 +	};
 +}
 +
@@ -106,7 +147,7 @@ index 91ac55e23..0df0711c7 100644
 +	size_t i;
 +
 +	for (i = 0; i < b->work.bytes / 2; i++)
-+		WRITE_ONCE(work[i], 0x0088);
++		WRITE_ONCE(work[i], IMX50_EPDC_WB_PIXEL(IMX50_EPDC_WB_HOLD_COLOR));
 +	dma_wmb();
 +}
 +
@@ -114,7 +155,7 @@ index 91ac55e23..0df0711c7 100644
  {
  	unsigned int i;
 diff --git a/drivers/video/fbdev/imx50-epdc-hw.c b/drivers/video/fbdev/imx50-epdc-hw.c
-index 3f79150e2..547f6f619 100644
+index 3f79150e2..5a95782ab 100644
 --- a/drivers/video/fbdev/imx50-epdc-hw.c
 +++ b/drivers/video/fbdev/imx50-epdc-hw.c
 @@ -71,6 +71,7 @@ void imx50_epdc_hw_init(struct imx50_epdc_hw *hw, void __iomem *base)
@@ -125,7 +166,7 @@ index 3f79150e2..547f6f619 100644
  
  }
  
-@@ -230,6 +231,26 @@ irqreturn_t imx50_epdc_hw_irq(int irq, void *data)
+@@ -230,6 +231,28 @@ irqreturn_t imx50_epdc_hw_irq(int irq, void *data)
  		hw->events.wb = true;
  	if (pending & E_EOF)
  		hw->events.eof = true;
@@ -133,12 +174,14 @@ index 3f79150e2..547f6f619 100644
 +		/* RM 24.4.31: DEBUG_LUT0[14:5] counts remaining frames.
 +		 * Sample in IRQ so worker coalescing does not lose scan boundaries.
 +		 */
-+		if (hw->wb_live && (pending & (E_EOF | BIT(0)))) {
-+			u32 left = (readl(hw->base + 0x540) >> 5) & 0x3ff;
++		if (hw->wb_live && (pending & (E_EOF | BIT(IMX50_EPDC_WB_LUT)))) {
++			u32 left = readl(hw->base + 0x540 + IMX50_EPDC_WB_LUT * 16);
 +
-+			hw->wb_frame = hw->wb_completed + 1023 - left;
-+			if (pending & BIT(0)) {
-+				hw->wb_completed += 1023;
++			left = (left >> 5) & IMX50_EPDC_WB_FRAMES;
++
++			hw->wb_frame = hw->wb_completed + IMX50_EPDC_WB_FRAMES - left;
++			if (pending & BIT(IMX50_EPDC_WB_LUT)) {
++				hw->wb_completed += IMX50_EPDC_WB_FRAMES;
 +				hw->wb_frame = hw->wb_completed;
 +				hw->wb_live = false;
 +			}
@@ -152,7 +195,7 @@ index 3f79150e2..547f6f619 100644
  	if (pending & E_UNDERRUN)
  		pr_warn_ratelimited("imx50-epdc: TCE underrun\n");
  	if (pending & E_BUS_ERROR) {
-@@ -238,7 +259,9 @@ irqreturn_t imx50_epdc_hw_irq(int irq, void *data)
+@@ -238,7 +261,9 @@ irqreturn_t imx50_epdc_hw_irq(int irq, void *data)
  	} else {
  		u32 mask = readl(hw->base + E_MASK);
  
@@ -163,7 +206,7 @@ index 3f79150e2..547f6f619 100644
  		writel(mask, hw->base + E_MASK);
  	}
  	writel(pending, hw->base + E_IRQ_CLR);
-@@ -329,6 +352,21 @@ int imx50_epdc_hw_next_lut(struct imx50_epdc_hw *hw, bool *sync_eof)
+@@ -329,6 +354,21 @@ int imx50_epdc_hw_next_lut(struct imx50_epdc_hw *hw, bool *sync_eof)
  	return lut;
  }
  
@@ -185,7 +228,7 @@ index 3f79150e2..547f6f619 100644
  void imx50_epdc_hw_request_eof(struct imx50_epdc_hw *hw, bool enable)
  {
  	unsigned long flags;
-@@ -367,6 +405,12 @@ int imx50_epdc_hw_submit(struct imx50_epdc_hw *hw,
+@@ -367,6 +407,12 @@ int imx50_epdc_hw_submit(struct imx50_epdc_hw *hw,
  	writel(c->temperature, hw->base + E_TEMP);
  	writel(readl(hw->base + E_MASK) | E_WB | E_COLLISION | E_UNDERRUN |
  	       E_BUS_ERROR | E_IDLE | BIT(lut), hw->base + E_MASK);
@@ -232,7 +275,7 @@ index 48026c167..494664a43 100644
  void imx50_epdc_hw_fault(struct imx50_epdc_hw *hw, int error);
  irqreturn_t imx50_epdc_hw_irq(int irq, void *data);
 diff --git a/drivers/video/fbdev/imx50-epdc.c b/drivers/video/fbdev/imx50-epdc.c
-index 58c2b5bac..124dae93b 100644
+index 58c2b5bac..addca4507 100644
 --- a/drivers/video/fbdev/imx50-epdc.c
 +++ b/drivers/video/fbdev/imx50-epdc.c
 @@ -1,5 +1,14 @@
@@ -277,7 +320,7 @@ index 58c2b5bac..124dae93b 100644
  	if (e->buffers)
  		imx50_epdc_buffers_fault(e->buffers, error);
  	/* WB descriptor also occupies a LUT; retire it only through that LUT. */
-@@ -457,13 +479,65 @@ static struct epdc_update *epdc_select(struct imx50_epdc *e)
+@@ -457,13 +479,62 @@ static struct epdc_update *epdc_select(struct imx50_epdc *e)
  	return selected;
  }
  
@@ -316,15 +359,12 @@ index 58c2b5bac..124dae93b 100644
 +	put_unaligned_le64(16, table);
 +	put_unaligned_le64(16, table + 8);
 +	put_unaligned_le64(24, table + 16);
-+	put_unaligned_le64(1023, table + 24);
-+	for (f = 0; f < 1023; f++)
++	put_unaligned_le64(IMX50_EPDC_WB_FRAMES, table + 24);
++	for (f = 0; f < IMX50_EPDC_WB_FRAMES; f++)
 +		for (i = 0; i < 256; i++)
 +			table[32 + f * 256 + i] = i >> 4 == 0 ? black : i >> 4 == 15 ? white : 0;
-+	e->wb_info = (struct k4_epdc_wb_info) {
-+		.width = 800, .height = 600, .stride = 800, .size = 800 * 600 * 2,
-+		.hold = 0x0088, .black = 0x0008, .white = 0x00f8,
-+		.frames_per_lut = 1023, .push_frames = pushes,
-+	};
++	imx50_epdc_buffers_wb_info(e->buffers, &e->wb_info);
++	e->wb_info.push_frames = pushes;
 +	imx50_epdc_buffers_wb_command(e->buffers, e->wb_wave_dma, &e->wb_command);
 +	dma_wmb();
 +	imx50_epdc_hw_wb_session(&e->hw, true);
@@ -344,14 +384,14 @@ index 58c2b5bac..124dae93b 100644
  		epdc_off_locked(e);
  	mutex_unlock(&e->lock);
  }
-@@ -596,6 +670,25 @@ static void epdc_submit_work(struct work_struct *work)
+@@ -596,6 +667,25 @@ static void epdc_submit_work(struct work_struct *work)
  		epdc_fail_queue(e, ev.error);
  		goto out;
  	}
 +	if (e->wb_active) {
 +		if (ev.wb)
 +			e->wb_processing = false;
-+		if ((ev.luts & 1) && !e->wb_stopping) {
++		if ((ev.luts & BIT(IMX50_EPDC_WB_LUT)) && !e->wb_stopping) {
 +			ret = epdc_wb_submit(e);
 +			if (ret) {
 +				epdc_fail_queue(e, ret);
@@ -370,7 +410,7 @@ index 58c2b5bac..124dae93b 100644
  	epdc_events(e, &ev);
  	if (e->fault)
  		goto out;
-@@ -615,7 +708,7 @@ static void epdc_submit_work(struct work_struct *work)
+@@ -615,7 +705,7 @@ static void epdc_submit_work(struct work_struct *work)
  	}
  	if (e->wb)
  		goto watch;
@@ -379,7 +419,7 @@ index 58c2b5bac..124dae93b 100644
  		if (e->pixel_on && !READ_ONCE(e->hw.drained)) {
  			deadline = e->drain_deadline;
  			goto watch;
-@@ -682,6 +775,13 @@ static void epdc_submit_work(struct work_struct *work)
+@@ -682,6 +772,13 @@ static void epdc_submit_work(struct work_struct *work)
  		deadline = e->init_deadline;
  		goto watch;
  	}
@@ -393,7 +433,7 @@ index 58c2b5bac..124dae93b 100644
  	lut = imx50_epdc_hw_next_lut(&e->hw, &sync_eof);
  	if (lut == -EBUSY)
  		goto watch;
-@@ -805,6 +905,8 @@ static void epdc_submit_work(struct work_struct *work)
+@@ -805,6 +902,8 @@ static void epdc_submit_work(struct work_struct *work)
  	goto watch;
  pending_error:
  	e->queue_error = ret;
@@ -402,7 +442,7 @@ index 58c2b5bac..124dae93b 100644
  	if (e->hw.fault) {
  		epdc_fail_queue(e, e->hw.fault);
  		goto out;
-@@ -935,7 +1037,7 @@ int imx50_epdc_send_update(struct imx50_epdc *e,
+@@ -935,7 +1034,7 @@ int imx50_epdc_send_update(struct imx50_epdc *e,
  		list_add_tail(&m->update, &u->markers);
  	}
  	mutex_lock(&e->lock);
@@ -411,7 +451,7 @@ index 58c2b5bac..124dae93b 100644
  		ret = e->fault ? e->fault : -EBUSY;
  		goto fail;
  	}
-@@ -944,6 +1046,13 @@ int imx50_epdc_send_update(struct imx50_epdc *e,
+@@ -944,6 +1043,13 @@ int imx50_epdc_send_update(struct imx50_epdc *e,
  		if (ret)
  			goto fail;
  	}
@@ -425,7 +465,7 @@ index 58c2b5bac..124dae93b 100644
  	if (e->scheme == IMX50_EPDC_SNAPSHOT) {
  		ret = epdc_capture(u);
  		if (ret)
-@@ -1028,6 +1137,11 @@ int imx50_epdc_set_powerdown_delay(struct imx50_epdc *e, int delay)
+@@ -1028,6 +1134,11 @@ int imx50_epdc_set_powerdown_delay(struct imx50_epdc *e, int delay)
  	if (delay < IMX50_EPDC_POWERDOWN_DISABLE)
  		return -EINVAL;
  	mutex_lock(&e->lock);
@@ -437,7 +477,7 @@ index 58c2b5bac..124dae93b 100644
  	e->powerdown_delay = delay;
  	cancel_delayed_work(&e->done_work);
  	if (delay != IMX50_EPDC_POWERDOWN_DISABLE && epdc_queue_idle(e) && e->pixel_on)
-@@ -1076,6 +1190,258 @@ int imx50_epdc_powerdown(struct imx50_epdc *e)
+@@ -1076,6 +1187,258 @@ int imx50_epdc_powerdown(struct imx50_epdc *e)
  }
  EXPORT_SYMBOL_GPL(imx50_epdc_powerdown);
  
@@ -696,7 +736,7 @@ index 58c2b5bac..124dae93b 100644
  struct imx50_epdc *devm_imx50_epdc_get(struct device *consumer, const char *property)
  {
  	struct device_node *np;
-@@ -1112,7 +1478,11 @@ static int epdc_suspend(struct device *dev)
+@@ -1112,7 +1475,11 @@ static int epdc_suspend(struct device *dev)
  	mutex_lock(&e->lock);
  	e->suspended = true;
  	mutex_unlock(&e->lock);
@@ -709,7 +749,7 @@ index 58c2b5bac..124dae93b 100644
  	if (ret)
  		WRITE_ONCE(e->suspended, false);
  	return ret;
-@@ -1191,9 +1561,13 @@ static int epdc_probe(struct platform_device *pdev)
+@@ -1191,9 +1558,13 @@ static int epdc_probe(struct platform_device *pdev)
  	void __iomem *base;
  	int ret;
  
@@ -724,7 +764,7 @@ index 58c2b5bac..124dae93b 100644
  	e->dev = dev;
  	if (!of_find_property(dev->of_node, "display-supply", NULL) ||
  	    !of_find_property(dev->of_node, "vcom-supply", NULL))
-@@ -1205,6 +1579,7 @@ static int epdc_probe(struct platform_device *pdev)
+@@ -1205,6 +1576,7 @@ static int epdc_probe(struct platform_device *pdev)
  			return -EINVAL;
  	}
  	mutex_init(&e->lock);
@@ -732,12 +772,13 @@ index 58c2b5bac..124dae93b 100644
  	INIT_WORK(&e->power_work, epdc_power_work);
  	INIT_WORK(&e->submit_work, epdc_submit_work);
  	INIT_DELAYED_WORK(&e->done_work, epdc_done_work);
-@@ -1293,6 +1668,19 @@ static int epdc_probe(struct platform_device *pdev)
+@@ -1293,6 +1665,20 @@ static int epdc_probe(struct platform_device *pdev)
  	ret = devm_regulator_register_notifier(e->display, &e->power_nb);
  	if (ret)
  		return ret;
-+/* Reserve synthetic waveform DMA at probe, independently of firmware. */
-+	e->wb_wave = dma_alloc_coherent(dev, 32 + 1023 * 256, &e->wb_wave_dma, GFP_KERNEL);
++	/* Reserve synthetic waveform DMA at probe, independently of firmware. */
++	e->wb_wave = dma_alloc_coherent(dev, IMX50_EPDC_WB_WAVE_BYTES,
++				       &e->wb_wave_dma, GFP_KERNEL);
 +	if (!e->wb_wave)
 +		return -ENOMEM;
 +	e->wb_misc = (struct miscdevice) {
@@ -746,13 +787,13 @@ index 58c2b5bac..124dae93b 100644
 +	};
 +	ret = misc_register(&e->wb_misc);
 +	if (ret) {
-+		dma_free_coherent(dev, 32 + 1023 * 256, e->wb_wave, e->wb_wave_dma);
++		dma_free_coherent(dev, IMX50_EPDC_WB_WAVE_BYTES, e->wb_wave, e->wb_wave_dma);
 +		return ret;
 +	}
  	platform_set_drvdata(pdev, e);
  	WRITE_ONCE(e->ready, true);
  	dev_info(dev, "K4 display service ready; refresh requires a consumer request\n");
-@@ -1308,7 +1696,11 @@ static void epdc_shutdown(struct platform_device *pdev)
+@@ -1308,7 +1694,11 @@ static void epdc_shutdown(struct platform_device *pdev)
  	WRITE_ONCE(e->ready, false);
  	e->stopped = true;
  	mutex_unlock(&e->lock);
@@ -765,7 +806,7 @@ index 58c2b5bac..124dae93b 100644
  	mutex_lock(&e->lock);
  	if (ret && !epdc_queue_idle(e))
  		epdc_fail_queue(e, ret);
-@@ -1324,6 +1716,7 @@ static void epdc_remove(struct platform_device *pdev)
+@@ -1324,6 +1714,7 @@ static void epdc_remove(struct platform_device *pdev)
  	/* Managed links have detached fbdev and other consumers. Unregister the
  	 * notifier before draining work so it cannot queue another power callback.
  	 */
@@ -773,20 +814,20 @@ index 58c2b5bac..124dae93b 100644
  	epdc_shutdown(pdev);
  	devm_regulator_unregister_notifier(e->display, &e->power_nb);
  	cancel_work_sync(&e->power_work);
-@@ -1340,6 +1733,8 @@ static void epdc_remove(struct platform_device *pdev)
+@@ -1340,6 +1731,8 @@ static void epdc_remove(struct platform_device *pdev)
  		else
  			e->wave = NULL;
  	}
 +	if (!e->fault)
-+		dma_free_coherent(e->dev, 32 + 1023 * 256, e->wb_wave, e->wb_wave_dma);
++		dma_free_coherent(e->dev, IMX50_EPDC_WB_WAVE_BYTES, e->wb_wave, e->wb_wave_dma);
  	if (e->fault) {
  		/* No retained software callbacks: devres frees IRQ and MMIO. Only
  		 * the quarantined DMA data and clock handles survive until reset.
 diff --git a/include/linux/imx50-epdc-buffer.h b/include/linux/imx50-epdc-buffer.h
-index f11d8548d..c48d638e4 100644
+index f11d8548d..b1ca5fd60 100644
 --- a/include/linux/imx50-epdc-buffer.h
 +++ b/include/linux/imx50-epdc-buffer.h
-@@ -5,6 +5,7 @@
+@@ -5,14 +5,25 @@
  #include <linux/types.h>
  
  struct device;
@@ -794,13 +835,33 @@ index f11d8548d..c48d638e4 100644
  struct imx50_pxp;
  struct imx50_epdc_source;
  struct imx50_epdc_rect;
-@@ -44,6 +45,14 @@ int imx50_epdc_buffers_put(struct imx50_epdc_buffers *b, unsigned int slot);
+ struct imx50_epdc_buffers;
++struct k4_epdc_wb_info;
+ 
+ #define IMX50_EPDC_NUM_LUTS 16
+ #define IMX50_EPDC_MAX_UPDATES 20
+ 
++/* RM 24.4.31: DEBUG_LUTn[14:5] is a 10-bit remaining-frame counter. */
++#define IMX50_EPDC_WB_FRAMES ((1U << 10) - 1)
++#define IMX50_EPDC_WB_WAVE_BYTES (32 + IMX50_EPDC_WB_FRAMES * 256)
++#define IMX50_EPDC_WB_LUT 0U
++#define IMX50_EPDC_WB_HOLD_COLOR 8U
++/* WB [15:12] LUT, [7:4] target and [3:0] current color (RM 24.3.8). */
++#define IMX50_EPDC_WB_PIXEL(target) ((IMX50_EPDC_WB_LUT << 12) | \
++	((target) << 4) | IMX50_EPDC_WB_HOLD_COLOR)
++
+ /* Controller submission values; UPD_CTRL starts DMA and is written last. */
+ struct imx50_epdc_command {
+ 	u32 waveform_addr, working_addr, update_addr;
+@@ -44,6 +55,16 @@ int imx50_epdc_buffers_put(struct imx50_epdc_buffers *b, unsigned int slot);
  int imx50_epdc_buffers_error(struct imx50_epdc_buffers *b);
  void imx50_epdc_buffers_fault(struct imx50_epdc_buffers *b, int error);
  int imx50_epdc_buffers_invalidate(struct imx50_epdc_buffers *b);
 +/* Idle owner only: derive electrode actions from the validated A2 sequence. */
 +int imx50_epdc_buffers_wb_actions(struct imx50_epdc_buffers *b, u32 mode,
 +	u32 temperature, u8 *black, u8 *white, u32 *push_frames);
++void imx50_epdc_buffers_wb_info(struct imx50_epdc_buffers *b,
++	struct k4_epdc_wb_info *info);
 +void imx50_epdc_buffers_wb_command(struct imx50_epdc_buffers *b,
 +	u32 waveform_addr, struct imx50_epdc_command *command);
 +int imx50_epdc_buffers_wb_mmap(struct imx50_epdc_buffers *b,
@@ -811,7 +872,7 @@ index f11d8548d..c48d638e4 100644
  #endif
 diff --git a/include/uapi/linux/k4-epdc-wb.h b/include/uapi/linux/k4-epdc-wb.h
 new file mode 100644
-index 000000000..6ae42325f
+index 000000000..265513a07
 --- /dev/null
 +++ b/include/uapi/linux/k4-epdc-wb.h
 @@ -0,0 +1,27 @@
@@ -833,9 +894,9 @@ index 000000000..6ae42325f
 +	__u32 generation, reserved;
 +};
 +
-+#define K4_EPDC_WB_START _IOR('W', 0, struct k4_epdc_wb_info)
-+#define K4_EPDC_WB_WAIT_FRAME _IOR('W', 1, struct k4_epdc_wb_frame)
-+#define K4_EPDC_WB_STOP _IO('W', 2)
++#define K4_EPDC_WB_START _IOR(0xB8, 0, struct k4_epdc_wb_info)
++#define K4_EPDC_WB_WAIT_FRAME _IOR(0xB8, 1, struct k4_epdc_wb_frame)
++#define K4_EPDC_WB_STOP _IO(0xB8, 2)
 +
 +/* mmap offset zero, length info.size (rounded to pages by mmap).
 + * STOP revokes mappings: subsequent access raises SIGBUS. Close the last
@@ -901,7 +962,7 @@ index 974e02e35..d36ce7197 100644
 +static void put_unaligned_le64(u64 v,void *p)
 +{ u8 *b=p;for(unsigned i=0;i<8;i++)b[i]=v>>(i*8); }
 diff --git a/porting/test-epdc-pipeline.py b/porting/test-epdc-pipeline.py
-index a8afd1d0d..fdf554c5c 100644
+index a8afd1d0d..f77751ae5 100644
 --- a/porting/test-epdc-pipeline.py
 +++ b/porting/test-epdc-pipeline.py
 @@ -39,11 +39,16 @@ int imx50_pxp_convert(struct imx50_pxp *p,const struct imx50_pxp_image *im)
@@ -961,7 +1022,7 @@ index a8afd1d0d..fdf554c5c 100644
      event(E_WB|1,0);shutdown_model();
  
      /* Automatic refresh takes the same synchronous capture path as mxcfb SEND. */
-@@ -268,8 +274,109 @@ static void snapshot_scenarios(void)
+@@ -268,8 +274,144 @@ static void snapshot_scenarios(void)
      assert(e.wb&&update_pixels()[0]==60&&e.hw.last_mode==2);
      event(E_WB|1,0);shutdown_model();
  }
@@ -977,12 +1038,46 @@ index a8afd1d0d..fdf554c5c 100644
 +{ event(E_WB|1,0); }
 +static void next_scan(void)
 +{ regs[0x540/4]-=1<<5;event(E_EOF,0); }
++static void wb_layout_scenarios(void)
++{
++    setup();
++    static const u8 wf[32]={0};
++    /* Distinct panel sizes must come from the actual allocated DMA layout. */
++    const unsigned widths[]={4,12,804,1024},heights[]={8,15,32,128};
++    for(unsigned i=0;i<4;i++){
++        setup();
++        struct imx50_epdc_buffers *buf=imx50_epdc_buffers_alloc(&dev,widths[i],heights[i],wf,sizeof(wf),7,16);
++        assert(!IS_ERR(buf));
++        struct k4_epdc_wb_info info;
++        imx50_epdc_buffers_wb_info(buf,&info);
++        assert(info.width==widths[i]&&info.height==heights[i]);
++        assert(info.stride==ALIGN(widths[i],4)&&info.size==info.stride*heights[i]*2);
++        assert(info.size==buf->work.bytes&&info.frames_per_lut==1023);
++        assert(info.hold==(0U<<12|8U<<4|8)&&info.black==(0U<<12|0U<<4|8)&&info.white==(0U<<12|15U<<4|8));
++        struct imx50_epdc_command c;
++        imx50_epdc_buffers_wb_command(buf,0x74000000,&c);
++        assert(c.size==(widths[i]|heights[i]<<16)&&c.fixed==0xc0008888);
++        assert(((c.control>>16)&15)==0&&c.working_addr==buf->work.dma+EPDC_GUARD);
++        struct vm_area_struct v={.vm_end=PAGE_ALIGN(info.size)};
++        assert(!imx50_epdc_buffers_wb_mmap(buf,&v));
++        assert(!imx50_epdc_buffers_free(buf));scenarios++;
++    }
++    /* Non-multiple-of-four panel width with a padded WB descriptor. */
++    struct imx50_epdc_buffers padded={.width=803,.height=32,.work.bytes=51456};
++    struct k4_epdc_wb_info layout;
++    imx50_epdc_buffers_wb_info(&padded,&layout);
++    assert(layout.width==803&&layout.height==32&&layout.stride==804&&layout.size==51456);
++    assert(_IOC_TYPE(K4_EPDC_WB_START)==0xb8&&_IOC_NR(K4_EPDC_WB_START)==0);
++    assert(_IOC_TYPE(K4_EPDC_WB_WAIT_FRAME)==0xb8&&_IOC_NR(K4_EPDC_WB_WAIT_FRAME)==1);
++    assert(_IOC_TYPE(K4_EPDC_WB_STOP)==0xb8&&_IOC_NR(K4_EPDC_WB_STOP)==2);
++    printf("PASS: WB DMA-derived panel layout, roundup4 stride, complete pixel values, 10-bit frame limit and registered ioctl block\n");
++}
 +static void wb_session_scenarios(void)
 +{
 +    setup();startup();
 +    assert(epdc_wb_fops.unlocked_ioctl==epdc_wb_ioctl);
 +    kref_init(&e.refs);e.ready=true;
-+    u8 synth[32+1023*256];e.wb_wave=synth;e.wb_wave_dma=0x74000000;
++    u8 synth[IMX50_EPDC_WB_WAVE_BYTES];e.wb_wave=synth;e.wb_wave_dma=0x74000000;
 +    struct file a={.private_data=&e.wb_misc},b={.private_data=&e.wb_misc};
 +    assert(!epdc_wb_open(NULL,&a)&&!epdc_wb_open(NULL,&b));
 +    struct vm_area_struct v={.vm_end=PAGE_ALIGN(800*600*2)};
@@ -1067,11 +1162,12 @@ index a8afd1d0d..fdf554c5c 100644
 +}
  int main(void)
  {
++    wb_layout_scenarios();
 +    wb_session_scenarios();
      snapshot_scenarios();
      setup();startup();
      unsigned before=pxp_calls;
-@@ -420,6 +527,7 @@ int main(void)
+@@ -420,6 +562,7 @@ int main(void)
  }
  '''
  owner = read('drivers/video/fbdev/imx50-epdc.c')
@@ -1079,7 +1175,7 @@ index a8afd1d0d..fdf554c5c 100644
  owner = owner[owner.index('struct epdc_marker'):owner.index('struct imx50_epdc *devm_imx50_epdc_get')]
  base = (root / 'porting/epdc-multi-lut-stub.h').read_text()
  # Keep allocation fault injection local to the integrated scheduler model.
-@@ -433,10 +541,10 @@ static void *kvmalloc(size_t n,int f)
+@@ -433,10 +576,10 @@ static void *kvmalloc(size_t n,int f)
  static void kfree(void *p) { if(p){assert(cpu_live);cpu_live--;}free(p); }
  static void kvfree(void *p) { if(p){assert(kv_live);kv_live--;}free(p); }
  ''' + base[b:]
@@ -1093,7 +1189,7 @@ index a8afd1d0d..fdf554c5c 100644
      c, exe = Path(tmp)/'test.c', Path(tmp)/'test'
      c.write_text('\n'.join(parts))
 diff --git a/porting/test-epdc-waveform.py b/porting/test-epdc-waveform.py
-index 33456c5c8..3809101ef 100644
+index 33456c5c8..252a52cff 100644
 --- a/porting/test-epdc-waveform.py
 +++ b/porting/test-epdc-waveform.py
 @@ -24,7 +24,6 @@ static unsigned kv_live;
@@ -1104,6 +1200,15 @@ index 33456c5c8..3809101ef 100644
  static bool device_property_read_bool(struct device *dev,const char *name) {
      assert(dev&&!strcmp(name,"wbf-decode"));return decode_selected;
  }
+@@ -280,7 +279,7 @@ base = base.replace('static unsigned dma_live,dma_attempts,fail_alloc;',
+ base = base.replace('==fail_alloc', '==bad_alloc')
+ base = base.replace('static void kfree(void *p) { free(p); }',
+                     'static void kfree(const void *p) { free((void *)p); }')
+-parts = [base,preamble]
++parts = [base,preamble,read('include/uapi/linux/k4-epdc-wb.h')]
+ parts += [read(f'include/linux/{n}.h') for n in ('imx50-pxp','imx50-epdc-image','imx50-epdc-buffer')]
+ parts += [read('drivers/video/fbdev/imx50-epdc-hw.h'),shim,
+           read('drivers/video/fbdev/imx50-epdc-buffer.c'),
 diff --git a/project/docs/DISPLAY.md b/project/docs/DISPLAY.md
 index 77372c889..57c7144f9 100644
 --- a/project/docs/DISPLAY.md
