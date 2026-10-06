@@ -59,15 +59,19 @@ hold/black/white 值、frames_per_lut 和 push_frames；当前实现为 `0x0088`
 
 ## 重启与漏帧
 
-`K4_EPDC_WB_WAIT_FRAME` 阻塞到下一个 EOF 边界，返回会话累计执行的 LUT 帧数与
-重启次数 generation。信号中断返回 EINTR。硬件 IRQ 根据
+`K4_EPDC_WB_WAIT_FRAME` 为 IOWR，播放器输入上次返回的 frame 与 generation，每次
+START 后首次将两者置 0。WB 处理完成后，累计帧号超过输入或 generation 变化时
+立即返回；没有新进度时阻塞等待。计算期间已经经过的 EOF 可直接消费，避免额外
+等待一整帧。输出为当前会话累计执行的 LUT 帧数与重启次数 generation。
+信号中断返回 EINTR，等待期间会话停止或替换返回 ECANCELED（或硬件错误）。硬件 IRQ 根据
 `EPDC_DEBUG_LUT0[14:5]` 的剩余帧数累计帧进度（RM 24.4.31），在每次 EOF 保持中断
 启用并唤醒等待者；IRQ 直接记录进度，因此提交工作线程合并事件不丢帧。帧数跨重启
 累计，重启间隙不计。
 
 长 LUT 完成后核心提交工作线程立即以 LUT0 重提整屏不动，generation 增加。
 播放器观察到 generation 变化时，`resync()` 将写表及当前仍在推动的忙组重新写入。
-WAIT_FRAME 在 WB 处理完成后的扫描边界返回，使恢复写入发生在 WB 处理之后。
+若帧号未前进，仅重写动作并继续等待帧进度，不额外步进位置。
+WAIT_FRAME 在 WB 处理完成后返回已有进度或等待新进度，使恢复写入发生在 WB 处理之后。
 
 累计帧差超过 1 时，`catch_up()` 按 WB 实际动作补算多执行帧的位移并饱和到端点。
 已算好的下一帧动作仍然写入，端点最多额外推一帧。计算不能还原错过帧的中途目标变化；
