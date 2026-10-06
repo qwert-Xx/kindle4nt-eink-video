@@ -53,7 +53,7 @@ static int eof;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static int input_fd;
 
-/* 每像素状态 1 字节：[4:0] 位置 0..top，[5] 目标为白，[7:6] WB 里正在执行的动作
+/* 每像素状态 1 字节：[4:0] 位置，[5] 目标为白，[7:6] WB 里正在执行的动作
  * （0 不动，1 推白，2 推黑）。全屏 480KB，忙的部分能留在缓存里。16 像素一组。 */
 #define CH 16
 #define NCH (NPIX / CH)
@@ -64,6 +64,9 @@ static uint8_t st[NPIX] __attribute__((aligned(64)));
 static uint8_t target_bits[FRAME];
 static uint8_t busy[NCH];
 static int extra, top, nps;
+/* 位置 margin 为黑端、margin+top 为白端；两侧余量保存漏帧时端点外多执行的推动，
+ * 目标反转时一并推回，使净推动始终等于位置变化。 */
+static int margin;
 
 /* 下一帧要写的组与它们的 WB 目标色（每组 16 字节） */
 static uint32_t dirty[NCH];
@@ -163,7 +166,7 @@ static void finish(void)
 	for (unsigned int y = 0; top && y < H; y++)
 		for (unsigned int x = 0; x < W; x++)
 			fb[(size_t)y * fix.line_length + x] =
-				(st[y * W + x] & S_LV) * 2 >= top ? 0xff : 0x00;
+				(st[y * W + x] & S_LV) * 2 >= 2 * margin + top ? 0xff : 0x00;
 	send_full(2);
 	wait_marker(marker);
 	if (var_changed && ioctl(fbfd, FBIOPUT_VSCREENINFO, &old_var))
@@ -232,7 +235,7 @@ static void catch_up(unsigned int k)
 		for (int x = 0; x < CH; x++) {
 			uint8_t l = a[x] & S_LV, cur = a[x] >> 6;
 			uint8_t up = -(uint8_t)(cur == 1), down = -(uint8_t)(cur == 2);
-			uint8_t room_up = top - l, u = kk < room_up ? kk : room_up, d = kk < l ? kk : l;
+			uint8_t room_up = S_LV - l, u = kk < room_up ? kk : room_up, d = kk < l ? kk : l;
 			a[x] = (a[x] & ~S_LV) | (uint8_t)(l + (u & up) - (d & down));
 		}
 	}
@@ -243,7 +246,7 @@ static void catch_up(unsigned int k)
  * 不跳过补推区：每次推动都改变位置，净推动始终等于位置变化，直流不累积。 */
 static void compute(void)
 {
-	const uint8x16_t vtop = vdupq_n_u8(top);
+	const uint8x16_t vwhite = vdupq_n_u8(margin + top), vblack = vdupq_n_u8(margin);
 	const uint8x16_t mlv = vdupq_n_u8(S_LV), mtw = vdupq_n_u8(S_TW), mkeep = vdupq_n_u8(S_TW | S_CUR);
 	const uint8x16_t white = vdupq_n_u8(C_WHITE), hold = vdupq_n_u8(C_HOLD);
 	const uint8x16_t one = vdupq_n_u8(1), two = vdupq_n_u8(2);
@@ -258,9 +261,11 @@ static void compute(void)
 				continue;
 			uint8_t *a = st + c * CH;
 			uint8x16_t s0 = vld1q_u8(a);
-			uint8x16_t p = vandq_u8(s0, mlv), tm = vtstq_u8(s0, mtw), t = vandq_u8(tm, vtop);
+			uint8x16_t p = vandq_u8(s0, mlv), tm = vtstq_u8(s0, mtw);
 			uint8x16_t cu = vshrq_n_u8(s0, 6);
-			uint8x16_t up = vcltq_u8(p, t), down = vcgtq_u8(p, t);
+			/* 只朝目标端推；越过目标端的过冲保持不动，留到反转时推回 */
+			uint8x16_t up = vandq_u8(vcltq_u8(p, vwhite), tm);
+			uint8x16_t down = vbicq_u8(vcgtq_u8(p, vblack), tm);
 			/* up/down 为 0xff（-1）：p - up + down 即走一步 */
 			p = vaddq_u8(vsubq_u8(p, up), down);
 			vst1q_u8(a, vorrq_u8(p, vandq_u8(s0, mkeep)));
@@ -421,8 +426,9 @@ int main(int argc, char **argv)
 	if (nps > S_LV || extra > (S_LV - nps) / 2)
 		return fprintf(stderr, "push/extra exceeds state bits\n"), 1;
 	top = nps + 2 * extra;
+	margin = (S_LV - top) / 2;
 
-	memset(st, top | S_TW, sizeof(st));
+	memset(st, (margin + top) | S_TW, sizeof(st));
 	memset(target_bits, 0xff, sizeof(target_bits));
 	fprintf(stderr, "A2 pushes %d, extra %d, LUT %u frames\n", nps, extra, wbinfo.frames_per_lut);
 
