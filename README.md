@@ -7,22 +7,22 @@ Kindle 4 墨水屏动画播放的实验与优化：以工作缓冲（WB）逐像
 
 ## 与主线的关系
 
-内核来自独立的 Kindle 主线 Git 仓库，`kernel/mainline.lock` 锁定
-`refactor/k4-modularization` 分支上的提交 `27bb673d9e080a1ce90aae8160e68df232e1356c`。
-分支名用于说明来源，构建始终以完整提交为准。`kernel/patches/series` 顺序列出
-本仓库的 `git format-patch` 补丁，提供 EPDC WB 直驱会话接口。实验代码与记录在本仓库独立维护。
+内核基于 Linux v6.6.157 与公开仓库
+[kindle4nt-linux](https://github.com/qwert-Xx/kindle4nt-linux) 的 Kindle 4 补丁系列。
+`kernel/upstream.lock` 锁定 Linux 版本、下载地址、SHA256 和 kindle4nt-linux 的完整提交。
+本仓库的 `kernel/patches/series` 提供 EPDC WB 直驱会话接口，补丁采用
+`git format-patch` 格式。实验代码与记录在本仓库独立维护。
 
-构建脚本在指定输出目录的 `src` 创建 detached Git 工作树，以 `git am` 应用系列，
-随后调用该源码树的 `project/build.py`。相同提交与补丁系列可复用工作树；
-HEAD、已应用系列或已跟踪文件不匹配时重建该工作树。
-源码工作树与产物保留在输出目录供继续构建，脚本会打印保留位置。
-清理源码树用 `git -C "$KERNEL_SRC" worktree remove "$OUT/src"`，随后删除自己的输出目录。
+构建脚本将指定 Linux 源码复制到输出目录的 `src`，依次应用 kindle4nt-linux 的
+`kernel/patches/series` 和本仓库的补丁系列，再调用 kindle4nt-linux 的
+`project/build.py`。相同锁与补丁系列可复用源码树；锁或补丁系列变化时重建。
+源码与产物保留在输出目录，清理时删除该输出目录即可。
 
 ## 目录
 
 | 目录 | 内容 |
 | --- | --- |
-| `kernel/` | 主线锁、补丁系列、离线构建入口 |
+| `kernel/` | 公开源码锁、补丁系列、离线构建入口 |
 | `player/` | `k4-wb` 和 `k4-a2`、交叉编译 Makefile |
 | `tools/` | WB/波形探针、写入基准、扫描时序测量、墨水响应曲线测量（wbcurve） |
 | `host/` | 测试片生成、SSH 播放、相机录制、录像对比 |
@@ -34,10 +34,10 @@ HEAD、已应用系列或已跟踪文件不匹配时重建该工作树。
 ## 依赖
 
 主机脚本需要 bash、Python 3 标准库、ffmpeg（含 libx264、lavfi、v4l2）、ssh 和
-支持 `-N` 的 nc；构建用户态需要 `arm-linux-gnueabihf-gcc`、make 和主线的
+支持 `-N` 的 nc；构建用户态需要 `arm-linux-gnueabihf-gcc`、make 和公开 Kindle 补丁提供的
 `include/uapi/linux/mxcfb.h` 与补丁提供的 `include/uapi/linux/k4-epdc-wb.h`；测试需要 `qemu-arm-static`。
-内核还使用主线构建入口本身所需的 make、交叉 binutils、bison、flex、bc、
-开发头文件等主机构建依赖，详见主线 `project/docs/BUILD.md`。
+内核还使用 kindle4nt-linux 构建入口所需的 make、交叉 binutils、bison、flex、bc、
+开发头文件等主机构建依赖，详见 kindle4nt-linux 的 `project/docs/BUILD.md`。
 源码与工具应事先在本地准备，构建脚本没有下载步骤。
 
 设备需要匹配的 mxcfb 接口、已加载的面板波形、root 权限、`/dev/fb0`；
@@ -46,12 +46,18 @@ WB 播放器需要补丁提供的 `/dev/k4-epdc-wb`；内存探针需要 `/dev/m
 
 ## 快速开始
 
+从 [kernel.org](https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.6.157.tar.xz)
+取得 Linux v6.6.157 压缩包，按 `kernel/upstream.lock` 中的 SHA256 校验后解压。
+检出公开 Kindle 补丁仓库的锁定提交，再指定这两个源码目录；构建脚本离线运行。
 以下变量由使用者填写，源码路径和设备路径均为参数。
 
 ```bash
-KERNEL_SRC="<主线源码目录>"
+LINUX_SRC="<Linux v6.6.157 解压目录>"
+KINDLE4NT="<kindle4nt-linux 检出目录>"
+git clone https://github.com/qwert-Xx/kindle4nt-linux "$KINDLE4NT"
+git -C "$KINDLE4NT" checkout d179b232a51351ac3cad5b1acdbfda9917530ad0
 OUT="$PWD/build"
-python3 kernel/build.py --kernel-src "$KERNEL_SRC" --out "$OUT"
+python3 kernel/build.py --linux "$LINUX_SRC" --kindle4nt "$KINDLE4NT" --out "$OUT"
 make -C player KERNEL_SRC="$OUT/src"
 make -C tools KERNEL_SRC="$OUT/src"
 make -C player test KERNEL_SRC="$OUT/src"
@@ -116,7 +122,7 @@ python3 host/compare.py --video build/camera.mp4 --raw build/demo.raw \
 
 ## 当前限制
 
-锁定主线包含 Y8 快速路径、按原厂每 60 秒缓存的 Papyrus 温度和 UPDATE_SCHEME_SNAPSHOT，
+锁定的公开 Kindle 补丁包含 Y8 快速路径、按原厂每 60 秒缓存的 Papyrus 温度和 UPDATE_SCHEME_SNAPSHOT，
 `k4-a2` 使用 mxcfb SNAPSHOT；`k4-wb` 使用补丁提供的 START/WAIT_FRAME/STOP 与 WB mmap，
 驱动自动重启固定 LUT，以 EOF 帧边界同步写入。
 

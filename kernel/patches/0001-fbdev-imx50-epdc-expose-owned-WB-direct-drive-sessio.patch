@@ -1,23 +1,27 @@
-From 2284d230dc1e4d5f0b34f6b0f21257aa9b0801c5 Mon Sep 17 00:00:00 2001
+From 1fa78ecd176acf5a898eab799d0cbf44a1c9501e Mon Sep 17 00:00:00 2001
 From: qwert-Xx <128706845+qwert-Xx@users.noreply.github.com>
-Date: Tue, 6 Oct 2026 10:19:30 +0800
+Date: Tue, 6 Oct 2026 17:29:59 +0800
 Subject: [PATCH] fbdev: imx50-epdc: expose owned WB direct-drive sessions
 
-Reserve a private synthetic waveform DMA table, derive A2 electrode actions at session startup, and drive fixed-color FULL updates on LUT0. Count EOF progress in IRQ context and restart completed LUTs in the owner worker. Exclude normal updates while the session owns the panel.
+Reserve a synthetic waveform DMA table and derive A2 electrode actions
+at startup. Drive fixed-color FULL updates on LUT0, count EOF progress
+in IRQ context and restart completed LUTs in the owner worker. Exclude
+normal updates while the session owns the panel.
 
-Separate mmap inode references from device fd ownership and revoke mappings before draining STOP. Restore full canvas history, including SNAPSHOT capture, after STOP; stop on last fd close, suspend and removal. Keep stopped core objects alive for outstanding device files.
+Separate mmap inode references from device fd ownership and revoke
+mappings before draining STOP. Restore full canvas history, including
+SNAPSHOT capture, after STOP; stop on last fd close, suspend and removal.
+Keep stopped core objects alive for outstanding device files.
 
-Derive WB layout from buffer dimensions, roundup4 pitch and allocated bytes. Share named LUT/color/frame constants. Register ioctl type 0xB8, commands 00-1F. WAIT_FRAME is IOWR: compare the last returned frame/generation cursor against IRQ progress and return existing progress immediately. Serialize u64 reads, wait only for WB processing on restart, and recheck session state before returning.
+Derive WB layout from buffer dimensions, roundup4 pitch and allocated
+bytes. Register ioctl type 0xB8, commands 00-1F. WAIT_FRAME compares the
+last returned frame/generation cursor against IRQ progress and returns
+existing progress immediately, using only irq_lock.
 
-Host ASan/UBSan image, pipeline (53/54 DMA debug scenarios), framebuffer, waveform, PxP and Papyrus power suites pass. Models cover late cursor calls, matched cursor blocking, generation-only progress, input EFAULT, alternate dimensions and padded stride.
-
-Keep EOF-only session interrupts off the normal-priority owner worker and let WAIT_FRAME use only irq_lock. Waking that worker on every scan made the real-time player wait milliseconds behind its owner mutex.
-
-Count each EOF only while the session LUT is live and WB processing has completed. Preserve wb_frame as wb_completed at LUT completion and identify later submissions with wb_restarted. Sampling DEBUG_LUT remaining frames races EOF and can repeat or skip progress; scans before WB readiness and restart gaps do not count. Extend host coverage for these rules, EOF-only worker suppression, waits under the held owner mutex, and zero-frame restart generations.
-
-Supervisor measurements on panel A with a 50-second clip: missed frames 225 before these changes, 193 after removing mutex/worker contention, and 72 with EOF counting (68 computation overruns). Final decision rate is 83.1/s; four LUT restart boundary waits total 56 ms.
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Count EOF only while the session LUT is live and WB processing has
+completed. Preserve cumulative progress across restarts and increase
+generation for later submissions even when no frames were scanned.
+Keep EOF-only interrupts off the normal-priority owner worker.
 ---
  .../userspace-api/ioctl/ioctl-number.rst      |   1 +
  drivers/video/fbdev/imx50-epdc-buffer.c       |  90 +++-
@@ -26,15 +30,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  drivers/video/fbdev/imx50-epdc.c              | 427 +++++++++++++++++-
  include/linux/imx50-epdc-buffer.h             |  21 +
  include/uapi/linux/k4-epdc-wb.h               |  34 ++
- porting/epdc-multi-lut-stub.h                 |  50 ++
- porting/test-epdc-pipeline.py                 | 205 ++++++++-
- porting/test-epdc-waveform.py                 |   3 +-
- project/docs/DISPLAY.md                       |  36 ++
- 11 files changed, 901 insertions(+), 21 deletions(-)
+ 7 files changed, 619 insertions(+), 9 deletions(-)
  create mode 100644 include/uapi/linux/k4-epdc-wb.h
 
 diff --git a/Documentation/userspace-api/ioctl/ioctl-number.rst b/Documentation/userspace-api/ioctl/ioctl-number.rst
-index 264faaa9d..d6eef5d96 100644
+index 264faaa..d6eef5d 100644
 --- a/Documentation/userspace-api/ioctl/ioctl-number.rst
 +++ b/Documentation/userspace-api/ioctl/ioctl-number.rst
 @@ -354,6 +354,7 @@ Code  Seq#    Include File                                             Comments
@@ -46,7 +46,7 @@ index 264faaa9d..d6eef5d96 100644
  0xCA  00-0F  uapi/misc/cxl.h
  0xCA  10-2F  uapi/misc/ocxl.h
 diff --git a/drivers/video/fbdev/imx50-epdc-buffer.c b/drivers/video/fbdev/imx50-epdc-buffer.c
-index 91ac55e23..d5cc741e0 100644
+index 91ac55e..d5cc741 100644
 --- a/drivers/video/fbdev/imx50-epdc-buffer.c
 +++ b/drivers/video/fbdev/imx50-epdc-buffer.c
 @@ -6,6 +6,9 @@
@@ -161,7 +161,7 @@ index 91ac55e23..d5cc741e0 100644
  {
  	unsigned int i;
 diff --git a/drivers/video/fbdev/imx50-epdc-hw.c b/drivers/video/fbdev/imx50-epdc-hw.c
-index 3f79150e2..f25c6b08a 100644
+index 3f79150..f25c6b0 100644
 --- a/drivers/video/fbdev/imx50-epdc-hw.c
 +++ b/drivers/video/fbdev/imx50-epdc-hw.c
 @@ -71,6 +71,7 @@ void imx50_epdc_hw_init(struct imx50_epdc_hw *hw, void __iomem *base)
@@ -255,7 +255,7 @@ index 3f79150e2..f25c6b08a 100644
  	hw->drained = false;
  	writel(c->control, hw->base + E_COMMAND);
 diff --git a/drivers/video/fbdev/imx50-epdc-hw.h b/drivers/video/fbdev/imx50-epdc-hw.h
-index 48026c167..a92f7c300 100644
+index 48026c1..a92f7c3 100644
 --- a/drivers/video/fbdev/imx50-epdc-hw.h
 +++ b/drivers/video/fbdev/imx50-epdc-hw.h
 @@ -7,6 +7,7 @@
@@ -287,7 +287,7 @@ index 48026c167..a92f7c300 100644
  void imx50_epdc_hw_fault(struct imx50_epdc_hw *hw, int error);
  irqreturn_t imx50_epdc_hw_irq(int irq, void *data);
 diff --git a/drivers/video/fbdev/imx50-epdc.c b/drivers/video/fbdev/imx50-epdc.c
-index 58c2b5bac..5dc71c27d 100644
+index 58c2b5b..5dc71c2 100644
 --- a/drivers/video/fbdev/imx50-epdc.c
 +++ b/drivers/video/fbdev/imx50-epdc.c
 @@ -1,5 +1,14 @@
@@ -445,7 +445,7 @@ index 58c2b5bac..5dc71c27d 100644
  	lut = imx50_epdc_hw_next_lut(&e->hw, &sync_eof);
  	if (lut == -EBUSY)
  		goto watch;
-@@ -805,6 +902,8 @@ static void epdc_submit_work(struct work_struct *work)
+@@ -805,6 +902,8 @@ update_error:
  	goto watch;
  pending_error:
  	e->queue_error = ret;
@@ -858,7 +858,7 @@ index 58c2b5bac..5dc71c27d 100644
  		/* No retained software callbacks: devres frees IRQ and MMIO. Only
  		 * the quarantined DMA data and clock handles survive until reset.
 diff --git a/include/linux/imx50-epdc-buffer.h b/include/linux/imx50-epdc-buffer.h
-index f11d8548d..b1ca5fd60 100644
+index f11d854..b1ca5fd 100644
 --- a/include/linux/imx50-epdc-buffer.h
 +++ b/include/linux/imx50-epdc-buffer.h
 @@ -5,14 +5,25 @@
@@ -906,7 +906,7 @@ index f11d8548d..b1ca5fd60 100644
  #endif
 diff --git a/include/uapi/linux/k4-epdc-wb.h b/include/uapi/linux/k4-epdc-wb.h
 new file mode 100644
-index 000000000..27efd0ccd
+index 0000000..27efd0c
 --- /dev/null
 +++ b/include/uapi/linux/k4-epdc-wb.h
 @@ -0,0 +1,34 @@
@@ -944,398 +944,6 @@ index 000000000..27efd0ccd
 + * device fd to stop; mappings do not retain that fd's session ownership.
 + */
 +#endif
-diff --git a/porting/epdc-multi-lut-stub.h b/porting/epdc-multi-lut-stub.h
-index 974e02e35..d36ce7197 100644
---- a/porting/epdc-multi-lut-stub.h
-+++ b/porting/epdc-multi-lut-stub.h
-@@ -160,3 +160,53 @@ static void writel(u32 v,void *p)
-     if(off==0x160){assert(!(regs[0x4a0/4]&1));regs[0x4a0/4]|=1;regs[0x440/4]|=BIT((v>>16)&15);}
- }
- #define readl_poll_timeout(a,v,c,d,t) ({int r=-ETIMEDOUT;(void)(d);(void)(t);for(unsigned n=0;n<4;n++){v=readl(a);if(c){r=0;break;}}r;})
-+
-+/* File/DMA mapping model: VMA has a separate inode, STOP revokes its PTEs. */
-+#include <sys/ioctl.h>
-+#include <linux/types.h>
-+typedef uint16_t u16;
-+#define PAGE_ALIGN(n) ALIGN(n,4096)
-+#define PAGE_SIZE 4096
-+#define __user
-+#define THIS_MODULE NULL
-+#define MISC_DYNAMIC_MINOR 255
-+#define O_RDWR 2
-+#define copy_from_user(d,s,n) (!(s)?1:(memcpy(d,s,n),0))
-+#define copy_to_user(d,s,n) (!(d)?1:(memcpy(d,s,n),0))
-+#define init_waitqueue_head(w) (*(w)=0)
-+#define wait_event_timeout(w,cond,n) ((void)(w),(!(cond)&&wait_hook?(wait_hook(),0):0),(cond)?(long)((n)?:1):0L)
-+#undef wait_event_interruptible_timeout
-+#define wait_event_interruptible_timeout(w,cond,n) wait_event_timeout(w,cond,n)
-+static int wait_signal;
-+#define wait_event_interruptible(w,cond) ((void)(w),wait_signal ? -EINTR : ((!(cond)&&wait_hook)?(wait_hook(),0):0),wait_signal ? -EINTR : ((cond)?0:-EINTR))
-+struct kref { unsigned refs; };
-+static void kref_init(struct kref *r) { r->refs=1; }
-+static void kref_get(struct kref *r) { assert(r->refs);r->refs++; }
-+static void kref_put(struct kref *r,void (*release)(struct kref *)) { assert(r->refs);if(!--r->refs)release(r); }
-+struct address_space { unsigned revoked; };
-+struct inode { int unused; };
-+struct vm_area_struct;
-+struct file { void *private_data;struct address_space *f_mapping;unsigned refs; };
-+struct file_operations {
-+    void *owner;
-+    int (*open)(struct inode *,struct file *),(*release)(struct inode *,struct file *);
-+    long (*unlocked_ioctl)(struct file *,unsigned,unsigned long),(*compat_ioctl)(struct file *,unsigned,unsigned long);
-+    int (*mmap)(struct file *,struct vm_area_struct *);
-+    void *llseek;
-+};
-+struct miscdevice { unsigned minor;const char *name;const struct file_operations *fops;struct device *parent; };
-+struct vm_area_struct { unsigned long vm_start,vm_end,vm_pgoff;struct file *vm_file;void *mapped; };
-+static long compat_ptr_ioctl(struct file *f,unsigned c,unsigned long a) { return 0; }
-+#define no_llseek NULL
-+static unsigned mapping_live;
-+static struct file *anon_inode_getfile_secure(const char *n,const struct file_operations *ops,void *d,int flags,const struct inode *i)
-+{ struct file *f=calloc(1,sizeof(*f));f->f_mapping=calloc(1,sizeof(*f->f_mapping));f->refs=1;mapping_live++;return f; }
-+static void fput(struct file *f) { assert(f->refs);if(!--f->refs){free(f->f_mapping);free(f);mapping_live--;} }
-+static void vma_set_file(struct vm_area_struct *v,struct file *f) { f->refs++;v->vm_file=f; }
-+static void unmap_mapping_range(struct address_space *m,unsigned long a,unsigned long b,int c) { m->revoked++; }
-+static int dma_mmap_coherent(struct device *d,struct vm_area_struct *v,void *cpu,dma_addr_t dma,size_t size)
-+{ assert(v->vm_end-v->vm_start==size);v->mapped=cpu;return 0; }
-+static u64 get_unaligned_le64(const void *p)
-+{ const u8 *b=p;u64 v=0;for(unsigned i=0;i<8;i++)v|=(u64)b[i]<<(i*8);return v; }
-+static void put_unaligned_le64(u64 v,void *p)
-+{ u8 *b=p;for(unsigned i=0;i<8;i++)b[i]=v>>(i*8); }
-diff --git a/porting/test-epdc-pipeline.py b/porting/test-epdc-pipeline.py
-index a8afd1d0d..f12be8500 100644
---- a/porting/test-epdc-pipeline.py
-+++ b/porting/test-epdc-pipeline.py
-@@ -39,11 +39,16 @@ int imx50_pxp_convert(struct imx50_pxp *p,const struct imx50_pxp_image *im)
- wave = r'''
- struct imx50_epdc_waveform { struct imx50_epdc_buffers *buffers; };
- static struct imx50_epdc_waveform wave;
--static struct imx50_epdc_waveform *imx50_epdc_waveform_load(struct device *d,const char *a,const char *b,unsigned w,unsigned h)
--{ (void)a;(void)b;static const u8 bytes[32]={0};wave.buffers=imx50_epdc_buffers_alloc(d,w,h,bytes,sizeof(bytes),7,16);return IS_ERR(wave.buffers)?(void *)wave.buffers:&wave; }
--static struct imx50_epdc_buffers *imx50_epdc_waveform_buffers(struct imx50_epdc_waveform *w) { return w->buffers; }
--static int imx50_epdc_waveform_temperature(struct imx50_epdc_waveform *w,int t) { assert(w&&t==25000);return 8; }
--static int imx50_epdc_waveform_mode(struct imx50_epdc_waveform *w,unsigned mode) { assert(w&&mode<7);return mode; }
-+struct imx50_epdc_waveform *imx50_epdc_waveform_load(struct device *d,const char *a,const char *b,unsigned w,unsigned h)
-+{ (void)a;(void)b;u8 bytes[8*7+8*16+8+9*256]={0};
-+for(unsigned m=0;m<7;m++)put_unaligned_le64(8*7,bytes+8*m);
-+for(unsigned t=0;t<16;t++)put_unaligned_le64(8*7+8*16,bytes+8*7+8*t);
-+put_unaligned_le64(9,bytes+8*7+8*16);
-+for(unsigned f=0;f<9;f++){bytes[8*7+8*16+8+f*256+0x0f]=2;bytes[8*7+8*16+8+f*256+0xf0]=1;}
-+wave.buffers=imx50_epdc_buffers_alloc(d,w,h,bytes,sizeof(bytes),7,16);return IS_ERR(wave.buffers)?(void *)wave.buffers:&wave; }
-+struct imx50_epdc_buffers *imx50_epdc_waveform_buffers(struct imx50_epdc_waveform *w) { return w->buffers; }
-+int imx50_epdc_waveform_temperature(struct imx50_epdc_waveform *w,int t) { assert(w&&t==25000);return 8; }
-+int imx50_epdc_waveform_mode(struct imx50_epdc_waveform *w,enum imx50_epdc_waveform_mode mode) { assert(w&&mode<7);return mode; }
- '''
- fb_source = read('drivers/video/fbdev/imx50-epdc-fb.c')
- fb_shim = r'''
-@@ -55,7 +60,6 @@ fb_shim = r'''
- #define copy_to_user(d,s,n) (!(d)?1:(memcpy(d,s,n),0))
- struct fb_deferred_io { unsigned long delay; };
- struct fb_deferred_io_pageref { unsigned long offset; struct list_head list; };
--#define PAGE_SIZE 4096
- #define min_t(t,a,b) min((t)(a),(t)(b))
- struct fb_info { void *par, *screen_buffer; struct delayed_work deferred_work; };
- static bool schedule_delayed_work(struct delayed_work *w,unsigned long delay)
-@@ -71,6 +75,7 @@ fb += fb_source[fb_source.index('static int k4_fb_send_update'):fb_source.index(
- tests = r'''
- static struct imx50_epdc e;
- static struct device dev;
-+static void *dev_get_drvdata(struct device *d) { assert(d==&dev);return &e; }
- static struct imx50_pxp pxp;
- static struct clk clocks[4];
- static struct regulator supplies[2];
-@@ -80,6 +85,7 @@ static struct gpio_desc gpio[2];
- static u8 pixels[800*600];
- static unsigned scenarios;
- static struct imx50_epdc_source source;
-+SUSPEND_CODE
- static void pump(void)
- {
-     unsigned n=0;
-@@ -253,8 +259,8 @@ static void snapshot_scenarios(void)
-     /* History restoration uses the captured region without expanding its source. */
-     setup();startup();e.scheme=IMX50_EPDC_SNAPSHOT;e.restore_pending=true;
-     pixels[5*800+3]=42;send(3,5,13,17,1060,1,0,0);
--    assert(update_pixels()[0]==42&&e.hw.last_full);
--    assert(e.hw.last_coordinates==(3U|(5U<<16))&&e.hw.last_size==(13U|(17U<<16)));
-+    assert(update_pixels()[5*800+3]==42&&e.hw.last_full);
-+    assert(!e.hw.last_coordinates&&e.hw.last_size==(800U|(600U<<16)));
-     event(E_WB|1,0);shutdown_model();
- 
-     /* Automatic refresh takes the same synchronous capture path as mxcfb SEND. */
-@@ -268,8 +274,186 @@ static void snapshot_scenarios(void)
-     assert(e.wb&&update_pixels()[0]==60&&e.hw.last_mode==2);
-     event(E_WB|1,0);shutdown_model();
- }
-+static void complete_wb_start(void)
-+{
-+    pump();
-+    if(e.in_init)event(E_WB|1,0);
-+    assert(e.wb_active&&e.wb_processing);
-+    /* Scans before WB processing completes cannot drive session pixels. */
-+    event(E_EOF,0);
-+    assert(!e.hw.wb_ready&&!e.hw.wb_frame&&!e.submit_work.pending);
-+    event(E_WB|E_EOF,0);
-+    assert(e.hw.wb_ready&&!e.hw.wb_frame);
-+}
-+static void complete_wb_stop(void)
-+{ event(E_WB|1,0); }
-+static unsigned scan_waits;
-+static void next_scan(void)
-+{ scan_waits++;event(E_EOF,0); }
-+static void wb_layout_scenarios(void)
-+{
-+    setup();
-+    static const u8 wf[32]={0};
-+    /* Distinct panel sizes must come from the actual allocated DMA layout. */
-+    const unsigned widths[]={4,12,804,1024},heights[]={8,15,32,128};
-+    for(unsigned i=0;i<4;i++){
-+        setup();
-+        struct imx50_epdc_buffers *buf=imx50_epdc_buffers_alloc(&dev,widths[i],heights[i],wf,sizeof(wf),7,16);
-+        assert(!IS_ERR(buf));
-+        struct k4_epdc_wb_info info;
-+        imx50_epdc_buffers_wb_info(buf,&info);
-+        assert(info.width==widths[i]&&info.height==heights[i]);
-+        assert(info.stride==ALIGN(widths[i],4)&&info.size==info.stride*heights[i]*2);
-+        assert(info.size==buf->work.bytes&&info.frames_per_lut==1023);
-+        assert(info.hold==(0U<<12|8U<<4|8)&&info.black==(0U<<12|0U<<4|8)&&info.white==(0U<<12|15U<<4|8));
-+        struct imx50_epdc_command c;
-+        imx50_epdc_buffers_wb_command(buf,0x74000000,&c);
-+        assert(c.size==(widths[i]|heights[i]<<16)&&c.fixed==0xc0008888);
-+        assert(((c.control>>16)&15)==0&&c.working_addr==buf->work.dma+EPDC_GUARD);
-+        struct vm_area_struct v={.vm_end=PAGE_ALIGN(info.size)};
-+        assert(!imx50_epdc_buffers_wb_mmap(buf,&v));
-+        assert(!imx50_epdc_buffers_free(buf));scenarios++;
-+    }
-+    /* Non-multiple-of-four panel width with a padded WB descriptor. */
-+    struct imx50_epdc_buffers padded={.width=803,.height=32,.work.bytes=51456};
-+    struct k4_epdc_wb_info layout;
-+    imx50_epdc_buffers_wb_info(&padded,&layout);
-+    assert(layout.width==803&&layout.height==32&&layout.stride==804&&layout.size==51456);
-+    assert(_IOC_TYPE(K4_EPDC_WB_START)==0xb8&&_IOC_NR(K4_EPDC_WB_START)==0);
-+    assert(_IOC_TYPE(K4_EPDC_WB_WAIT_FRAME)==0xb8&&_IOC_NR(K4_EPDC_WB_WAIT_FRAME)==1);
-+    assert(_IOC_DIR(K4_EPDC_WB_WAIT_FRAME)==(_IOC_READ|_IOC_WRITE));
-+    assert(_IOC_TYPE(K4_EPDC_WB_STOP)==0xb8&&_IOC_NR(K4_EPDC_WB_STOP)==2);
-+    printf("PASS: WB DMA-derived panel layout, roundup4 stride, complete pixel values, 10-bit frame limit and registered ioctl block\n");
-+}
-+static void wb_session_scenarios(void)
-+{
-+    setup();startup();
-+    assert(epdc_wb_fops.unlocked_ioctl==epdc_wb_ioctl);
-+    kref_init(&e.refs);e.ready=true;
-+    u8 synth[IMX50_EPDC_WB_WAVE_BYTES];e.wb_wave=synth;e.wb_wave_dma=0x74000000;
-+    struct file a={.private_data=&e.wb_misc},b={.private_data=&e.wb_misc};
-+    assert(!epdc_wb_open(NULL,&a)&&!epdc_wb_open(NULL,&b));
-+    struct vm_area_struct v={.vm_end=PAGE_ALIGN(800*600*2)};
-+    assert(epdc_wb_mmap(&a,&v)==-EINVAL);
-+    struct k4_epdc_wb_info info;
-+    wait_hook=complete_wb_start;
-+    assert(!epdc_wb_ioctl(&a,K4_EPDC_WB_START,(unsigned long)&info));
-+    wait_hook=NULL;
-+    assert(info.hold==0x88&&info.black==8&&info.white==0xf8);
-+    assert(info.frames_per_lut==1023&&info.push_frames==9&&info.size==800*600*2);
-+    assert(e.hw.wb_direct&&e.powerdown_delay==-1&&e.hw.last_full);
-+    for(unsigned f=0;f<1023;f++)for(unsigned i=0;i<256;i++)
-+        assert(synth[32+f*256+i]==(i>>4==0?2:i>>4==15?1:0));
-+    struct imx50_epdc_update u={{3,5,13,17},2,0,1500,0};
-+    assert(imx50_epdc_send_update(&e,&source,&u)==-EBUSY);
-+    struct fb_info fi={.screen_buffer=pixels};
-+    struct k4_fb front={.info=&fi,.epdc=&e,.width=800,.height=600,.stride=800,.format=IMX50_EPDC_Y8};
-+    fi.par=&front;
-+    struct mxcfb_update_data req={.update_region={5,3,13,17},.waveform_mode=2,.temp=TEMP_USE_AMBIENT};
-+    assert(k4_fb_ioctl(&fi,MXCFB_SEND_UPDATE,(unsigned long)&req)==-EBUSY);
-+    front.auto_mode=IMX50_EPDC_AUTOMATIC_MODE;front.waveform_mode=2;
-+    struct list_head pages;INIT_LIST_HEAD(&pages);k4_fb_damage(&front,3,5,13,17);
-+    k4_fb_deferred(&fi,&pages);assert(front.last_error==-EBUSY);
-+    assert(epdc_wb_ioctl(&b,K4_EPDC_WB_START,(unsigned long)&info)==-EBUSY);
-+    assert(epdc_wb_ioctl(&b,K4_EPDC_WB_STOP,0)==-EBUSY);
-+    assert(!epdc_wb_mmap(&a,&v)&&v.vm_file!=&a);
-+    struct k4_epdc_wb_frame frame={0};
-+    scan_waits=0;wait_hook=next_scan;
-+    /* A blocking wait must progress even while the owner mutex is held. */
-+    mutex_lock(&e.lock);
-+    assert(!epdc_wb_ioctl(&a,K4_EPDC_WB_WAIT_FRAME,(unsigned long)&frame));
-+    mutex_unlock(&e.lock);
-+    assert(frame.frame==1&&frame.generation==0&&scan_waits==1);
-+    wait_signal=1;
-+    assert(epdc_wb_ioctl(&a,K4_EPDC_WB_WAIT_FRAME,(unsigned long)&frame)==-EINTR);
-+    wait_signal=0;wait_hook=NULL;
-+    /* DEBUG_LUT countdown values do not determine the EOF count. */
-+    regs[0x540/4]=7<<5;event(E_EOF,0);
-+    regs[0x540/4]=1023<<5;event(E_EOF,0);
-+    assert(e.hw.wb_frame==3&&!e.submit_work.pending);
-+    /* Computation crossed EOF before ioctl: consume progress without sleeping. */
-+    wait_hook=next_scan;
-+    mutex_lock(&e.lock);
-+    assert(!epdc_wb_ioctl(&a,K4_EPDC_WB_WAIT_FRAME,(unsigned long)&frame));
-+    mutex_unlock(&e.lock);
-+    assert(frame.frame==3&&frame.generation==0&&scan_waits==1);
-+    /* The same returned cursor now blocks until the next scan. */
-+    assert(!epdc_wb_ioctl(&a,K4_EPDC_WB_WAIT_FRAME,(unsigned long)&frame));
-+    assert(frame.frame==4&&frame.generation==0&&scan_waits==2);
-+    assert(epdc_wb_ioctl(&a,K4_EPDC_WB_WAIT_FRAME,0)==-EFAULT);
-+    wait_hook=NULL;
-+    /* EOF wakes frame waiters without scheduling the owner worker. */
-+    unsigned wakes=e.hw.wb_wait;
-+    for(unsigned i=0;i<2;i++){
-+        regs[0x540/4]=(i?1:999)<<5;regs[E_IRQ/4]|=E_EOF;
-+        assert(imx50_epdc_hw_irq(27,&e.hw)==IRQ_HANDLED);
-+        assert(!e.submit_work.pending&&e.hw.wb_wait==wakes+i+1);
-+    }
-+    assert(e.hw.wb_frame==6);
-+    event(1,0);
-+    assert(e.hw.wb_completed==6&&e.hw.wb_frame==6&&e.hw.wb_generation==1);
-+    /* Restart gaps, including an EOF simultaneous with WB done, do not count. */
-+    event(E_EOF,0);assert(e.hw.wb_frame==6&&!e.hw.wb_ready);
-+    event(E_WB|E_EOF,0);assert(e.hw.wb_frame==6&&e.hw.wb_ready);
-+    wait_hook=next_scan;
-+    assert(!epdc_wb_ioctl(&a,K4_EPDC_WB_WAIT_FRAME,(unsigned long)&frame));
-+    assert(frame.frame==6&&frame.generation==1&&scan_waits==2);
-+    /* Generation alone is progress too, even with an equal frame cursor. */
-+    frame.generation=0;
-+    assert(!epdc_wb_ioctl(&a,K4_EPDC_WB_WAIT_FRAME,(unsigned long)&frame));
-+    assert(frame.frame==6&&frame.generation==1&&scan_waits==2);
-+    assert(!epdc_wb_ioctl(&a,K4_EPDC_WB_WAIT_FRAME,(unsigned long)&frame));
-+    assert(frame.frame==7&&frame.generation==1&&scan_waits==3);
-+    printf("PASS: WB WAIT_FRAME cursor: late call returns immediately, matched cursor waits, owner mutex independence, generation-only progress and input EFAULT\n");
-+    printf("PASS: WB EOF accounting: pre-WB scans excluded, countdown-independent IRQ count, LUT completion accumulation, restart gaps and EOF-only worker suppression\n");
-+    wait_hook=complete_wb_stop;
-+    assert(!epdc_wb_ioctl(&a,K4_EPDC_WB_STOP,0));wait_hook=NULL;
-+    assert(!e.wb_owner&&!e.hw.wb_direct&&e.restore_pending&&e.powerdown_delay==500);
-+    assert(e.hw.wb_frame==7&&e.hw.wb_completed==7);
-+    assert(v.vm_file->f_mapping->revoked==1&&mapping_live==1);
-+    assert(epdc_wb_mmap(&a,&v)==-EINVAL);
-+    assert(*(u16 *)(e.buffers->work.cpu+EPDC_GUARD)==0x88);
-+    fput(v.vm_file);assert(!mapping_live);
-+    /* Unknown history expands SNAPSHOT as well as queue-mode updates. */
-+    e.scheme=IMX50_EPDC_SNAPSHOT;send(3,5,13,17,1501,2,0,0);
-+    assert(e.hw.last_full&&!e.hw.last_coordinates&&e.hw.last_size==(600U<<16|800));
-+    event(E_WB|1,0);
-+    wait_hook=complete_wb_start;
-+    assert(!epdc_wb_ioctl(&a,K4_EPDC_WB_START,(unsigned long)&info));
-+    assert(!epdc_wb_mmap(&a,&v));
-+    wait_hook=complete_wb_stop;
-+    assert(!epdc_wb_close(NULL,&a));wait_hook=NULL;
-+    assert(!e.wb_owner&&e.refs.refs==2&&mapping_live==1);
-+    assert(v.vm_file->f_mapping->revoked==1);fput(v.vm_file);
-+    assert(!mapping_live);
-+    /* A fresh owner may START, and suspend stops before gating clocks. */
-+    wait_hook=complete_wb_start;
-+    assert(!epdc_wb_ioctl(&b,K4_EPDC_WB_START,(unsigned long)&info));
-+    wait_hook=complete_wb_stop;
-+    assert(!epdc_suspend(&dev));wait_hook=NULL;
-+    assert(e.suspended&&!e.pixel_on&&!e.hw.wb_direct);
-+    assert(!epdc_resume(&dev));assert(!epdc_wb_close(NULL,&b));
-+    shutdown_model();
-+    /* START performs initialization itself on a cold controller. */
-+    setup();e.wb_wave=synth;e.wb_wave_dma=0x74000000;kref_init(&e.refs);
-+    a.private_data=&e.wb_misc;assert(!epdc_wb_open(NULL,&a));
-+    wait_hook=complete_wb_start;
-+    assert(!epdc_wb_ioctl(&a,K4_EPDC_WB_START,(unsigned long)&info));
-+    /* Generation tracks submissions even when the preceding LUT scanned zero frames. */
-+    wait_hook=NULL;event(1,0);
-+    assert(!e.hw.wb_frame&&!e.hw.wb_completed&&e.hw.wb_generation==1);
-+    event(E_WB|E_EOF,0);
-+    frame=(struct k4_epdc_wb_frame){0};
-+    assert(!epdc_wb_ioctl(&a,K4_EPDC_WB_WAIT_FRAME,(unsigned long)&frame));
-+    assert(!frame.frame&&frame.generation==1);
-+    wait_hook=complete_wb_stop;assert(!epdc_wb_close(NULL,&a));wait_hook=NULL;
-+    shutdown_model();
-+    printf("PASS: WB START/STOP, A2 synthesis, EOF/frame/generation, SEND/automatic EBUSY, second START, close STOP, suspend STOP, mmap rejection/revocation, full SNAPSHOT restore\n");
-+}
- int main(void)
- {
-+    wb_layout_scenarios();
-+    wb_session_scenarios();
-     snapshot_scenarios();
-     setup();startup();
-     unsigned before=pxp_calls;
-@@ -420,6 +604,7 @@ int main(void)
- }
- '''
- owner = read('drivers/video/fbdev/imx50-epdc.c')
-+tests = tests.replace('SUSPEND_CODE', owner[owner.index('static int epdc_suspend'):owner.index('static DEFINE_SIMPLE_DEV_PM_OPS')])
- owner = owner[owner.index('struct epdc_marker'):owner.index('struct imx50_epdc *devm_imx50_epdc_get')]
- base = (root / 'porting/epdc-multi-lut-stub.h').read_text()
- # Keep allocation fault injection local to the integrated scheduler model.
-@@ -433,10 +618,10 @@ static void *kvmalloc(size_t n,int f)
- static void kfree(void *p) { if(p){assert(cpu_live);cpu_live--;}free(p); }
- static void kvfree(void *p) { if(p){assert(kv_live);kv_live--;}free(p); }
- ''' + base[b:]
--parts = [base]
-+parts = [base, read('include/uapi/linux/k4-epdc-wb.h')]
- parts += [read(f'include/linux/{n}.h') for n in ('imx50-pxp','imx50-epdc-image','imx50-epdc-buffer','imx50-epdc')]
- parts += [pxp, read('drivers/video/fbdev/imx50-epdc-image.c'),read('drivers/video/fbdev/imx50-epdc-buffer.c'),
--          read('drivers/video/fbdev/imx50-epdc-hw.h'), read('drivers/video/fbdev/imx50-epdc-hw.c'),wave,owner,fb,tests]
-+          read('drivers/video/fbdev/imx50-epdc-waveform.h'), read('drivers/video/fbdev/imx50-epdc-hw.h'), read('drivers/video/fbdev/imx50-epdc-hw.c'),wave,owner,fb,tests]
- with tempfile.TemporaryDirectory() as tmp:
-     c, exe = Path(tmp)/'test.c', Path(tmp)/'test'
-     c.write_text('\n'.join(parts))
-diff --git a/porting/test-epdc-waveform.py b/porting/test-epdc-waveform.py
-index 33456c5c8..252a52cff 100644
---- a/porting/test-epdc-waveform.py
-+++ b/porting/test-epdc-waveform.py
-@@ -24,7 +24,6 @@ static unsigned kv_live;
- static void *kvzalloc(size_t n, int flags) { void *p=kzalloc(n,flags);if(p)kv_live++;return p; }
- static void decoder_kvfree(const void *p) { if(p){assert(kv_live);kv_live--;kfree(p);} }
- #define kvfree decoder_kvfree
--static void put_unaligned_le64(u64 value,void *out) { u8 *p=out;for(unsigned i=0;i<8;i++)p[i]=(u8)(value>>(8*i)); }
- static bool device_property_read_bool(struct device *dev,const char *name) {
-     assert(dev&&!strcmp(name,"wbf-decode"));return decode_selected;
- }
-@@ -280,7 +279,7 @@ base = base.replace('static unsigned dma_live,dma_attempts,fail_alloc;',
- base = base.replace('==fail_alloc', '==bad_alloc')
- base = base.replace('static void kfree(void *p) { free(p); }',
-                     'static void kfree(const void *p) { free((void *)p); }')
--parts = [base,preamble]
-+parts = [base,preamble,read('include/uapi/linux/k4-epdc-wb.h')]
- parts += [read(f'include/linux/{n}.h') for n in ('imx50-pxp','imx50-epdc-image','imx50-epdc-buffer')]
- parts += [read('drivers/video/fbdev/imx50-epdc-hw.h'),shim,
-           read('drivers/video/fbdev/imx50-epdc-buffer.c'),
-diff --git a/project/docs/DISPLAY.md b/project/docs/DISPLAY.md
-index 77372c889..ac15ab1ed 100644
---- a/project/docs/DISPLAY.md
-+++ b/project/docs/DISPLAY.md
-@@ -73,3 +73,39 @@ MXCFB_SET_WAVEFORM_MODES；该命令及其它未实现的 NXP ioctl 返回 ENOTT
- 工具构建与根配方见[构建指南](BUILD.md)和[维护配方](MAINTENANCE-INPUTS.md)。
- 波形输入见[显示波形](WAVEFORMS.md)。主机测试与实机缺口见
- [移植记录](../../porting/EPDC-MXCFB-20261004.md)。
-+
-+## WB 逐像素直驱接口
-+
-+核心提供 `/dev/k4-epdc-wb`，接口定义在 `include/uapi/linux/k4-epdc-wb.h`。
-+`K4_EPDC_WB_START` 排空普通更新队列，按当前温度档 A2 的黑白动作生成独立
-+1023 帧波形，以固定当前色/目标色 8、FULL、LUT0 提交整屏，保持电源开启。
-+返回宽高、像素 stride、WB 字节数、完整 16 位 hold/black/white 值、LUT 长度和
-+A2 推动帧数。动作极性来自加载的面板波形。
-+
-+START 成功后可用 offset 0、长度 info.size 的共享 mmap 访问 WB。
-+`K4_EPDC_WB_WAIT_FRAME` 为 IOWR，输入上次返回的 frame/generation，每次 START 后
-+首次将两者置 0。WB 处理完成后，已有更大的累计帧号或 generation 变化时立即返回；
-+否则阻塞等待帧进度，避免计算期间经过的 EOF 导致额外等待一帧。输出为当前累计执行
-+的 LUT 帧数和重启次数；帧数跨 LUT 重启累计，重启间隙不计。信号中断返回 EINTR，
-+等待期间会话停止或替换返回 ECANCELED（或硬件错误）。
-+
-+帧号由 IRQ 在 LUT 活动且 WB 处理完成后逐个累计 EOF；WB 就绪前的 EOF（包括与
-+WB 完成同时到达的 EOF）不计。LUT 完成时保存累计帧号，重提后继续累计。
-+每次 EOF 唤醒帧等待者；会话期间仅含 EOF 的中断只处理帧进度，WB 完成、LUT 完成等
-+事件才通知核心提交线程。WAIT_FRAME 只取 IRQ 锁，避免普通优先级提交线程持有
-+owner mutex 时阻塞实时播放线程。
-+
-+LUT 完成后核心提交线程以同一个 LUT 自动重提整屏不动，用户在 generation 变化后
-+重写仍需推动的像素。generation 由先前已提交过 LUT 的标志判断，前一轮扫描帧数
-+为 0 时也递增。会话期间普通 SEND_UPDATE 和前端自动刷新返回 EBUSY，
-+第二次 START 返回 EBUSY。
-+
-+`K4_EPDC_WB_STOP` 禁止重启、撤销映射、将 WB 写成不动并等待 LUT 排空，恢复关电
-+延迟并设置 restore_pending；下一次普通更新（包括 SNAPSHOT）采样整屏并以 FULL
-+恢复历史。STOP 后访问旧映射产生 SIGBUS，需 munmap 后在新会话重新 mmap。
-+映射使用独立匿名 inode，与设备 fd 的引用分开；关闭最后一个设备 fd 自动 STOP，
-+挂起与设备移除也先停止会话。尚存的文件引用仅保留已停止的核心对象，已撤销的映射
-+仅保留匿名 inode，DMA 在控制器排空且映射撤销后才能释放。
-+
-+该接口不实施直流平衡；主机模型与构建不能替代设备视觉、EOF 时序、温度、电源或
-+长期面板寿命验证。
 -- 
 2.43.0
 
