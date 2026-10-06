@@ -5,12 +5,13 @@
 /* 参考模型：逐像素标量一步，比较每帧写入 WB 的目标色和位置；另累计每像素实际推动
  * （含漏帧重复执行的推动），检查净推动始终等于位置变化（直流不累积）。 */
 static uint8_t rlv[NPIX], rtl[NPIX], rout[NPIX];
-static int rnet[NPIX];
+static int rnet[NPIX], rb[NPIX];
 static uint16_t fakewb[NPIX];
 int main(void)
 {
 	extra = 2; nps = 9; top = nps + 2 * extra; margin = (S_LV - top) / 2;
-	const int white = margin + top, black = margin;
+	bias_cap = 3; /* 小上限使跳过频繁触顶 */
+	const int white = margin + top, black = margin, lo = margin + extra, hi = margin + top - extra;
 	wb = fakewb; stride = W; wbinfo = (struct k4_epdc_wb_info){ .hold=0x5783, .black=0x5003, .white=0x50f3 };
 	memset(st, white | S_TW, sizeof(st));
 	memset(target_bits, 0xff, sizeof(target_bits));
@@ -52,12 +53,21 @@ int main(void)
 		flush_list();
 		for (int i = 0; i < NPIX; i++) {
 			uint8_t p = rlv[i];
+			/* 跳过补推区，跳过量受 bias 上限约束 */
+			if (rtl[i] == white) {
+				int d = p < lo ? lo - p : 0, room = bias_cap + rb[i], j = d < room ? d : room;
+				p += j, rb[i] -= j;
+			} else {
+				int d = p > hi ? p - hi : 0, room = bias_cap - rb[i], j = d < room ? d : room;
+				p -= j, rb[i] += j;
+			}
 			/* 只朝目标端推，越过目标端的过冲保持 */
 			uint8_t up = -(uint8_t)(rtl[i] == white && p < white);
 			uint8_t down = -(uint8_t)(rtl[i] == black && p > black);
 			rlv[i] = p + (up & 1) - (down & 1);
 			rnet[i] += (up & 1) - (down & 1);
-			dc_bad += rnet[i] != rlv[i] - white;
+			dc_bad += rnet[i] != rlv[i] - white + rb[i] || rb[i] != bias[i] ||
+				  rb[i] > bias_cap || rb[i] < -bias_cap;
 			rout[i] = (up & C_WHITE) | (~(up | down) & C_HOLD);
 			uint16_t expected = rout[i] == C_WHITE ? wbinfo.white : rout[i] == C_BLACK ? wbinfo.black : wbinfo.hold;
 			bad += fakewb[i] != expected;

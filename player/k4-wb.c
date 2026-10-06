@@ -2,7 +2,7 @@
 /* WB 直驱：驱动拥有合成波形、LUT 重启与扫描同步；用户态在每个 EOF 后
  * 改写 mmap 工作缓冲。每像素一字节位置/目标/动作状态，16 像素 NEON 步进，
  * 漏帧按驱动累计帧差补算，重启后重写仍在推动的组。
- * 用法：k4-wb <tcp_port> [extra=2]
+ * 用法：k4-wb <tcp_port> [extra=2] [bias=40]
  */
 #include <arm_neon.h>
 #include <fcntl.h>
@@ -67,6 +67,11 @@ static int extra, top, nps;
 /* 位置 margin 为黑端、margin+top 为白端；两侧余量保存漏帧时端点外多执行的推动，
  * 目标反转时一并推回，使净推动始终等于位置变化。 */
 static int margin;
+/* 目标反转时可跳过补推区（不推动即离开端点），这会让净推动偏离位置变化；偏离量
+ * 按像素记在 bias（净推动 − 位置变化），|bias| 不超过 bias_cap，到达上限后只能
+ * 逐档推回。跳过使像素在端点附近往返时被拉回端点，抵消墨水响应不对称造成的漂移。 */
+static int8_t bias[NPIX] __attribute__((aligned(16)));
+static int bias_cap;
 
 /* 下一帧要写的组与它们的 WB 目标色（每组 16 字节） */
 static uint32_t dirty[NCH];
@@ -250,6 +255,8 @@ static void compute(void)
 	const uint8x16_t mlv = vdupq_n_u8(S_LV), mtw = vdupq_n_u8(S_TW), mkeep = vdupq_n_u8(S_TW | S_CUR);
 	const uint8x16_t white = vdupq_n_u8(C_WHITE), hold = vdupq_n_u8(C_HOLD);
 	const uint8x16_t one = vdupq_n_u8(1), two = vdupq_n_u8(2);
+	const uint8x16_t vlo = vdupq_n_u8(margin + extra), vhi = vdupq_n_u8(margin + top - extra);
+	const uint8x16_t vcap = vdupq_n_u8(bias_cap);
 
 	dirty_n = 0;
 	const uint32_t *b4 = (const uint32_t *)busy;
@@ -263,6 +270,17 @@ static void compute(void)
 			uint8x16_t s0 = vld1q_u8(a);
 			uint8x16_t p = vandq_u8(s0, mlv), tm = vtstq_u8(s0, mtw);
 			uint8x16_t cu = vshrq_n_u8(s0, 6);
+			/* 跳过补推区：目标白时 p 升到 lo、目标黑时降到 hi，跳过量受 bias 余量限制。
+			 * bias 以 u8 模运算表示 int8；cap ± bias 落在 [0, 2·cap]。 */
+			{
+				int8_t *bp = bias + c * CH;
+				uint8x16_t b = vreinterpretq_u8_s8(vld1q_s8(bp));
+				uint8x16_t d = vbslq_u8(tm, vqsubq_u8(vlo, p), vqsubq_u8(p, vhi));
+				uint8x16_t room = vbslq_u8(tm, vaddq_u8(vcap, b), vsubq_u8(vcap, b));
+				uint8x16_t j = vminq_u8(d, room);
+				p = vbslq_u8(tm, vaddq_u8(p, j), vsubq_u8(p, j));
+				vst1q_s8(bp, vreinterpretq_s8_u8(vbslq_u8(tm, vsubq_u8(b, j), vaddq_u8(b, j))));
+			}
 			/* 只朝目标端推；越过目标端的过冲保持不动，留到反转时推回 */
 			uint8x16_t up = vandq_u8(vcltq_u8(p, vwhite), tm);
 			uint8x16_t down = vbicq_u8(vcgtq_u8(p, vblack), tm);
@@ -375,10 +393,11 @@ static void resync(void)
 int main(int argc, char **argv)
 {
 	if (argc < 2)
-		return fprintf(stderr, "usage: k4-wb <tcp_port> [extra=2]\n"), 2;
+		return fprintf(stderr, "usage: k4-wb <tcp_port> [extra=2] [bias=40]\n"), 2;
 	int port = atoi(argv[1]);
 	extra = argc > 2 ? atoi(argv[2]) : 2;
-	if (argc > 3 || extra < 0)
+	bias_cap = argc > 3 ? atoi(argv[3]) : 40;
+	if (argc > 4 || extra < 0 || bias_cap < 0 || bias_cap > 127)
 		return fprintf(stderr, "invalid arguments\n"), 2;
 	struct fb_var_screeninfo var;
 	pthread_t th;
