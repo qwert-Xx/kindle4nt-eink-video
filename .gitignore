@@ -18,3 +18,4 @@ tools/wbbench
 tools/epdc-timing
 tests/test_k4wb
 tests/test_neon
+tools/wbcurve

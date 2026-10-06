@@ -7,7 +7,7 @@ CFLAGS ?= -O3 -Wall -mcpu=cortex-a8 -mfpu=neon -mfloat-abi=hard -mno-unaligned-a
 CPPFLAGS += -idirafter $(KERNEL_SRC)/include/uapi
 LDFLAGS += -static -pthread
 
-PROGRAMS = wbprobe wbdrive wvinfo wbbench epdc-timing
+PROGRAMS = wbprobe wbdrive wvinfo wbbench epdc-timing wbcurve
 .PHONY: all clean
 all: $(PROGRAMS)
 %: %.c

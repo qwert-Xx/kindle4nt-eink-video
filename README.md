@@ -24,7 +24,7 @@ HEAD、已应用系列或已跟踪文件不匹配时重建该工作树。
 | --- | --- |
 | `kernel/` | 主线锁、补丁系列、离线构建入口 |
 | `player/` | `k4-wb` 和 `k4-a2`、交叉编译 Makefile |
-| `tools/` | WB/波形探针、写入基准、扫描时序测量 |
+| `tools/` | WB/波形探针、写入基准、扫描时序测量、墨水响应曲线测量（wbcurve） |
 | `host/` | 测试片生成、SSH 播放、相机录制、录像对比 |
 | `tests/` | 实际 WB 计算/写入函数与标量模型对拍、NEON 步进对拍 |
 | `docs/WB-DIRECT.md` | 现行 WB 机制、历史性能数据及限制 |
@@ -79,7 +79,7 @@ bash host/make-demo.sh build/anim.raw anim
 ```bash
 bash host/play.sh --target root@host --player player/k4-wb \
   --remote-player '<设备播放器路径>' --raw build/demo.raw --port 5000 -- 2
-# 自带参数：k4-wb PORT [extra=2]
+# 自带参数：k4-wb PORT [extra=2] [bias=40]
 # A2 对照（须内核支持 SNAPSHOT）：k4-a2 PORT [depth=8] [waveform=4]
 bash host/play.sh --target root@host --player player/k4-a2 \
   --remote-player '<设备播放器路径>' --raw build/demo.raw --port 5000 \
