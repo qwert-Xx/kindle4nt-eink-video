@@ -21,6 +21,7 @@ while (( $# )); do
     esac
 done
 if [[ -z $target || -z $player || -z $remote || -z $raw ]]; then usage >&2; exit 2; fi
+if [[ $remote != */* ]]; then remote="./$remote"; fi
 if [[ -z $stream_host ]]; then
     stream_host=${target##*@}
     stream_host=${stream_host#[}; stream_host=${stream_host%]}
@@ -28,7 +29,9 @@ fi
 # Quote each argument for the remote POSIX shell, including paths with spaces.
 quote() { local s=${1//\'/\'\\\'\'}; printf "'%s'" "$s"; }
 rprog=$(quote "$remote"); rlog=$(quote "$remote.log"); rpid=$(quote "$remote.pid")
-rdir=$(quote "$(dirname "$remote")")
+directory=${remote%/*}
+if [[ $directory == "$remote" ]]; then directory=.; fi
+rdir=$(quote "$directory")
 ssh "${ssh_args[@]}" "$target" "mkdir -p $rdir && cat > $rprog && chmod +x $rprog && : > $rlog" < "$player"
 command="$rprog $(quote "$port")"
 for arg in "${player_args[@]}"; do command+=" $(quote "$arg")"; done
@@ -49,7 +52,7 @@ ready=0
 for (( i=0; i<100; i++ )); do
     if ssh "${ssh_args[@]}" "$target" "grep -q listening $rlog"; then ready=1; break; fi
     if ! kill -0 "$runner" 2>/dev/null; then break; fi
-    sleep 0.5
+    python3 -c 'import time; time.sleep(0.5)'
 done
 if (( ! ready )); then echo 'Player did not start listening' >&2; exit 1; fi
 ffmpeg -v error -re -f rawvideo -pixel_format monob -video_size 800x600 -framerate 30 -i "$raw" -c:v copy -f rawvideo - |

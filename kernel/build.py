@@ -32,7 +32,9 @@ def main():
     state = json.loads(state_path.read_text()) if state_path.exists() else {}
     if tree.exists():
         head = git(tree, 'rev-parse', 'HEAD')
-        base = git(tree, 'merge-base', commit, head)
+        relation = subprocess.run(['git', '-C', str(tree), 'merge-base', commit, head],
+                                  text=True, stdout=subprocess.PIPE, check=False)
+        base = relation.stdout.strip()
         count = int(git(tree, 'rev-list', '--count', commit + '..' + head))
         clean = not git(tree, 'status', '--porcelain', '--untracked-files=no')
         valid = (clean and base == commit and
