@@ -64,7 +64,12 @@ int main(void)
 			/* 只朝目标端推，越过目标端的过冲保持 */
 			uint8_t up = -(uint8_t)(rtl[i] == white && p < white);
 			uint8_t down = -(uint8_t)(rtl[i] == black && p > black);
+			/* 还账：停在目标端、账户可还时每帧推一次，不改位置 */
+			uint8_t rbk = -(uint8_t)(rtl[i] == black && p <= black && rb[i] > 0);
+			uint8_t rwh = -(uint8_t)(rtl[i] == white && p >= white && rb[i] < 0);
 			rlv[i] = p + (up & 1) - (down & 1);
+			rb[i] += (rwh & 1) - (rbk & 1);
+			up |= rwh, down |= rbk;
 			rnet[i] += (up & 1) - (down & 1);
 			dc_bad += rnet[i] != rlv[i] - white + rb[i] || rb[i] != bias[i] ||
 				  rb[i] > bias_cap || rb[i] < -bias_cap;

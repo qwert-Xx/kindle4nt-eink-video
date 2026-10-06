@@ -72,6 +72,11 @@ static int margin;
  * 逐档推回。跳过使像素在端点附近往返时被拉回端点，抵消墨水响应不对称造成的漂移。 */
 static int8_t bias[NPIX] __attribute__((aligned(16)));
 static int bias_cap;
+/* 还账：像素停在黑端且 bias 偏白（>0）时每帧往黑推、停在白端且偏黑（<0）时每帧往白推，
+ * 位置不变、bias 每帧向 0 移一格，直到还清或目标改变。饱和端多推看不出或只使黑更深
+ * （A 机实测黑端 22 次后每次约深 0.35%，白端 18 次后基本不变）。连续推动使每次还账只
+ * 写两次 WB；间歇推动会在大面积到达端点时每隔几帧整屏写两次。参照 E Ink US10672350B2
+ * 的逐像素冲量账户：偏离后在后续驱动中主动减小账户。 */
 
 /* 下一帧要写的组与它们的 WB 目标色（每组 16 字节） */
 static uint32_t dirty[NCH];
@@ -257,6 +262,7 @@ static void compute(void)
 	const uint8x16_t one = vdupq_n_u8(1), two = vdupq_n_u8(2);
 	const uint8x16_t vlo = vdupq_n_u8(margin + extra), vhi = vdupq_n_u8(margin + top - extra);
 	const uint8x16_t vcap = vdupq_n_u8(bias_cap);
+	const int8x16_t zero_s = vdupq_n_s8(0);
 
 	dirty_n = 0;
 	const uint32_t *b4 = (const uint32_t *)busy;
@@ -272,21 +278,32 @@ static void compute(void)
 			uint8x16_t cu = vshrq_n_u8(s0, 6);
 			/* 跳过补推区：目标白时 p 升到 lo、目标黑时降到 hi，跳过量受 bias 余量限制。
 			 * bias 以 u8 模运算表示 int8；cap ± bias 落在 [0, 2·cap]。 */
+			int8_t *bp = bias + c * CH;
+			uint8x16_t b = vreinterpretq_u8_s8(vld1q_s8(bp));
 			{
-				int8_t *bp = bias + c * CH;
-				uint8x16_t b = vreinterpretq_u8_s8(vld1q_s8(bp));
 				uint8x16_t d = vbslq_u8(tm, vqsubq_u8(vlo, p), vqsubq_u8(p, vhi));
 				uint8x16_t room = vbslq_u8(tm, vaddq_u8(vcap, b), vsubq_u8(vcap, b));
 				uint8x16_t j = vminq_u8(d, room);
 				p = vbslq_u8(tm, vaddq_u8(p, j), vsubq_u8(p, j));
-				vst1q_s8(bp, vreinterpretq_s8_u8(vbslq_u8(tm, vsubq_u8(b, j), vaddq_u8(b, j))));
+				b = vbslq_u8(tm, vsubq_u8(b, j), vaddq_u8(b, j));
 			}
 			/* 只朝目标端推；越过目标端的过冲保持不动，留到反转时推回 */
 			uint8x16_t up = vandq_u8(vcltq_u8(p, vwhite), tm);
 			uint8x16_t down = vbicq_u8(vcgtq_u8(p, vblack), tm);
-			/* up/down 为 0xff（-1）：p - up + down 即走一步 */
+			/* 停在目标端、账户方向可还的像素 */
+			int8x16_t bs = vreinterpretq_s8_u8(b);
+			uint8x16_t owe_b = vbicq_u8(vandq_u8(vcleq_u8(p, vblack), vcgtq_s8(bs, zero_s)), tm);
+			uint8x16_t owe_w = vandq_u8(vandq_u8(vcgeq_u8(p, vwhite), vcltq_s8(bs, zero_s)), tm);
+			uint8x16_t rb = owe_b, rw = owe_w;
+			/* up/down 为 0xff（-1）：p - up + down 即走一步；还账推动不改位置 */
 			p = vaddq_u8(vsubq_u8(p, up), down);
+			b = vaddq_u8(vsubq_u8(b, rw), rb);
+			vst1q_s8(bp, vreinterpretq_s8_u8(b));
+			up = vorrq_u8(up, rw);
+			down = vorrq_u8(down, rb);
 			vst1q_u8(a, vorrq_u8(p, vandq_u8(s0, mkeep)));
+			uint8x16_t owe = vorrq_u8(owe_b, owe_w);
+			uint64x2_t oq = vreinterpretq_u64_u8(owe);
 			uint8x16_t nk = vorrq_u8(vandq_u8(up, one), vandq_u8(down, two));
 			uint64x2_t dq = vreinterpretq_u64_u8(veorq_u8(nk, cu));
 			uint64x2_t rq = vreinterpretq_u64_u8(nk);
@@ -295,7 +312,8 @@ static void compute(void)
 							     vbicq_u8(hold, vorrq_u8(up, down))));
 				dirty[dirty_n++] = c;
 				dirty_slot[c] = dirty_n;
-			} else if (!(vgetq_lane_u64(rq, 0) | vgetq_lane_u64(rq, 1))) {
+			} else if (!(vgetq_lane_u64(rq, 0) | vgetq_lane_u64(rq, 1) |
+				     vgetq_lane_u64(oq, 0) | vgetq_lane_u64(oq, 1))) {
 				busy[c] = 0;
 			}
 		}
